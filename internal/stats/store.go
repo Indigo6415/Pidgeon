@@ -33,6 +33,9 @@ type Kind uint8
 const (
 	KindFile Kind = iota
 	KindZip
+	// KindUpload is a file arriving in the inbox: bytes flow from the
+	// client to this machine, the opposite direction of the others.
+	KindUpload
 )
 
 // State is the lifecycle of a transfer.
@@ -62,7 +65,9 @@ type TransferInfo struct {
 	Client   string // remote IP
 	Name     string // display name (path or zip file name)
 	Kind     Kind
-	Total    int64 // expected bytes, -1 if unknown
+	Total    int64  // expected bytes, -1 if unknown
+	Inline   bool   // opened for viewing (preview), not saved: not counted as a download
+	Share    string // share link ID when the request came through /s/, else ""
 }
 
 // Transfer is one in-flight (or recently finished) download. Byte counts are
@@ -152,7 +157,9 @@ type Snapshot struct {
 	Uptime      time.Duration
 	Requests    int64
 	Downloads   int64 // completed transfers
+	Uploads     int64 // completed uploads into the inbox
 	BytesServed int64
+	BytesRecv   int64 // bytes uploaded into the inbox
 	OpenConns   int64
 	PeakConns   int64
 	Rate        float64   // aggregate bytes/sec right now (smoothed)
@@ -172,7 +179,9 @@ type Store struct {
 
 	requests    atomic.Int64
 	downloads   atomic.Int64
+	uploads     atomic.Int64
 	bytesServed atomic.Int64
+	bytesRecv   atomic.Int64
 	openConns   atomic.Int64
 	peakConns   atomic.Int64
 	nextID      atomic.Uint64
@@ -234,6 +243,12 @@ func (s *Store) CountRequest() { s.requests.Add(1) }
 // tracked transfers), feeding the aggregate rate and total.
 func (s *Store) AddBytes(n int) { s.bytesServed.Add(int64(n)) }
 
+// AddReceived records bytes uploaded by a client into the inbox.
+func (s *Store) AddReceived(n int) { s.bytesRecv.Add(int64(n)) }
+
+// BytesServed returns the total bytes sent to clients so far.
+func (s *Store) BytesServed() int64 { return s.bytesServed.Load() }
+
 // Begin registers a new transfer.
 func (s *Store) Begin(info TransferInfo) *Transfer {
 	t := &Transfer{TransferInfo: info, ID: s.nextID.Add(1), Started: time.Now()}
@@ -280,8 +295,14 @@ func (s *Store) End(t *Transfer, o Outcome) {
 	}
 	t.ended.Store(time.Now().UnixNano())
 	t.rateBits.Store(0)
-	// Whole-file downloads feed the counters and the "hottest file" stat.
-	if o == Completed {
+	// Uploads have their own counter; they are not downloads.
+	if o == Completed && t.Kind == KindUpload {
+		s.uploads.Add(1)
+		return
+	}
+	// Whole-file downloads feed the counters and the "hottest file" stat;
+	// previews (opened inline) don't count as downloads.
+	if o == Completed && !t.Inline {
 		s.downloads.Add(1)
 		s.mu.Lock()
 		s.hits[t.Name]++
@@ -300,6 +321,36 @@ func (s *Store) Cancel(id uint64) bool {
 	}
 	t.cancelled.Store(true)
 	return true
+}
+
+// CancelClient cancels every active transfer of one client IP and returns
+// how many were cancelled.
+func (s *Store) CancelClient(ip string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	// Flag each of the client's active transfers; their writers stop next Write.
+	for _, t := range s.transfers {
+		if t.Client == ip && State(t.state.Load()) == StateActive {
+			t.cancelled.Store(true)
+			n++
+		}
+	}
+	return n
+}
+
+// ActiveDownloads counts in-flight transfers to clients (uploads excluded).
+func (s *Store) ActiveDownloads() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	// Only outgoing transfers that haven't ended yet.
+	for _, t := range s.transfers {
+		if t.Kind != KindUpload && State(t.state.Load()) == StateActive {
+			n++
+		}
+	}
+	return n
 }
 
 // Log appends a request to the ring buffer.
@@ -398,7 +449,9 @@ func (s *Store) Snapshot() Snapshot {
 		Uptime:           now.Sub(s.started),
 		Requests:         s.requests.Load(),
 		Downloads:        s.downloads.Load(),
+		Uploads:          s.uploads.Load(),
 		BytesServed:      s.bytesServed.Load(),
+		BytesRecv:        s.bytesRecv.Load(),
 		OpenConns:        max(0, s.openConns.Load()),
 		PeakConns:        s.peakConns.Load(),
 		ActiveByListener: map[string]int{},

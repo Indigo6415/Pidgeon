@@ -16,6 +16,9 @@ import (
 //   - the token cookie
 //   - Authorization: Bearer <token>
 //   - HTTP basic auth with the configured user/password
+//
+// Share links (/s/...) carry their own capability and skip this check; the
+// share handler validates the link instead.
 func (s *Server) auth(next http.Handler) http.Handler {
 	tok := s.cfg.Token
 	user, pass := s.cfg.BasicUser, s.cfg.BasicPass
@@ -24,6 +27,11 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A share link is its own credential, scoped to one file or folder.
+		if strings.HasPrefix(r.URL.Path, "/s/") {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if tok != "" {
 			// A token in the query string upgrades to a cookie.
 			if q := r.URL.Query().Get("token"); q != "" && equal(q, tok) {
@@ -119,3 +127,31 @@ var loginPage = template.Must(template.New("login").Parse(`<!doctype html>
   {{if .Wrong}}<div class="err">That token didn't match.</div>{{end}}
   <button type="submit">Continue</button>
 </form></body></html>`))
+
+// waitingPage is shown to a device the operator hasn't approved yet (--ask).
+// It reloads itself until the host decides, so the visitor needs to do
+// nothing. Self-contained, like the login page.
+var waitingPage = template.Must(template.New("waiting").Parse(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta http-equiv="refresh" content="3">
+<title>{{.Name}} · waiting for approval</title>
+<style>
+  :root { --bg:#181818; --card:#1f1f1f; --fg:#cccccc; --muted:#9d9d9d; --line:#2b2b2b; --accent:#4daafc; }
+  @media (prefers-color-scheme: light) { :root { --bg:#f8f8f8; --card:#fff; --fg:#3b3b3b; --muted:#6f6f6f; --line:#e5e5e5; --accent:#005fb8; } }
+  * { box-sizing:border-box } body { margin:0; min-height:100dvh; display:grid; place-items:center;
+    background:var(--bg); color:var(--fg); font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; padding:16px }
+  main { width:100%; max-width:380px; background:var(--card); border:1px solid var(--line); border-radius:16px; padding:28px; text-align:center }
+  h1 { margin:0 0 6px; font-size:20px } p { margin:0; color:var(--muted); font-size:14px }
+  .dot { width:12px; height:12px; margin:0 auto 18px; border-radius:50%; background:var(--accent); animation:p 1.2s ease-in-out infinite }
+  code { font-size:13px; color:var(--fg) }
+  @keyframes p { 50% { opacity:.25; transform:scale(.7) } }
+</style></head><body>
+<main>
+  <div class="dot"></div>
+  <h1>Waiting for the host</h1>
+  <p>{{.Name}} asks the person running it to let each new device in.
+  They'll see <code>{{if .Device}}{{.Device}} · {{end}}{{.IP}}</code> on their screen.
+  This page continues by itself once they allow it.</p>
+</main></body></html>`))

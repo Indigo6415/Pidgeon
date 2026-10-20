@@ -1,6 +1,8 @@
-// Package server implements the read-only HTTP file server: directory
-// listing API, streamed file downloads with Range support, on-the-fly ZIP
-// archives, a live progress feed for the web UI, and the embedded web app.
+// Package server implements the HTTP file server: directory listing and
+// search APIs, streamed file downloads with Range support, on-the-fly ZIP
+// archives, share links, an optional upload inbox, a live event feed for the
+// web UI (progress, folder changes, files sent from the dashboard), and the
+// embedded web app. The served directory itself is never written to.
 package server
 
 import (
@@ -18,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Indigo6415/pidgeon/internal/brand"
+	"github.com/Indigo6415/pidgeon/internal/devices"
 	"github.com/Indigo6415/pidgeon/internal/listeners"
 	"github.com/Indigo6415/pidgeon/internal/stats"
 )
@@ -31,6 +34,20 @@ type Config struct {
 	BasicPass  string
 	Store      *stats.Store
 	Assets     fs.FS // web UI assets (index.html, app.js, app.css, ...)
+
+	Devices  *devices.Registry // device list and --ask gate; nil admits everyone
+	Inbox    string            // directory uploads are written to; "" disables uploads
+	InboxMax int64             // largest accepted upload in bytes; 0 = no limit
+
+	// Session limits, enforced by the app; the server refuses new downloads
+	// once MaxBytes have been served and reports the limits to the web UI.
+	MaxBytes int64
+	Expires  time.Time // when the server will stop; zero = never
+	Once     bool      // the server stops after the first completed download
+
+	// BaseURL returns a URL other devices can reach this server on (no
+	// trailing slash), used to build share links. Optional.
+	BaseURL func() string
 }
 
 // Server is the http.Handler shared by every listener.
@@ -42,8 +59,20 @@ type Server struct {
 	index   []byte   // index.html with the product name filled in
 	handler http.Handler
 
-	zipMu sync.Mutex
-	zips  map[string]*zipJob
+	zipMu     sync.Mutex
+	zips      map[string]*zipJob
+	shareZips map[string]string // share ID + path -> zip token, so share ZIPs can resume
+
+	shareMu sync.Mutex
+	shares  map[string]*share
+
+	inbox     *os.Root // upload target; nil when uploads are off
+	inboxRel  string   // inbox as a root-relative folder when it is inside the served dir
+	uploadMu  sync.Mutex
+	uploading map[string]bool // inbox names reserved by uploads in progress
+
+	hubMu sync.Mutex
+	subs  map[*subscriber]struct{} // open event streams
 
 	done      chan struct{} // closed by Close to end long-lived SSE streams
 	closeOnce sync.Once
@@ -78,8 +107,17 @@ func New(cfg Config) (*Server, error) {
 			"{{TAGLINE}}", html.EscapeString(brand.Tagline),
 			"{{PIGEON}}", pigeonHTML(),
 		).Replace(string(idx))),
-		zips: map[string]*zipJob{},
-		done: make(chan struct{}),
+		zips:      map[string]*zipJob{},
+		shareZips: map[string]string{},
+		shares:    map[string]*share{},
+		uploading: map[string]bool{},
+		subs:      map[*subscriber]struct{}{},
+		done:      make(chan struct{}),
+	}
+	if cfg.Inbox != "" {
+		if err := s.openInbox(cfg.Inbox); err != nil {
+			return nil, err
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -89,14 +127,23 @@ func New(cfg Config) (*Server, error) {
 	mux.HandleFunc("GET /api/ls", s.handleList)
 	mux.HandleFunc("GET /api/peek", s.handlePeek)
 	mux.HandleFunc("GET /api/size", s.handleSize)
+	mux.HandleFunc("GET /api/search", s.handleSearch)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
+	mux.HandleFunc("POST /api/watch", s.handleWatch)
 	mux.HandleFunc("POST /api/zip", s.handleZipCreate)
 	mux.HandleFunc("GET /zip/{token}/{file}", s.handleZipStream)
 	mux.HandleFunc("GET /f/{path...}", s.handleFile)
+	mux.HandleFunc("GET /api/shares", s.handleShareList)
+	mux.HandleFunc("POST /api/shares", s.handleShareCreate)
+	mux.HandleFunc("GET /s/{id}", s.handleShare)
+	mux.HandleFunc("GET /s/{id}/{rest...}", s.handleShare)
+	mux.HandleFunc("PUT /api/upload", s.handleUpload)
 
 	// Order matters: instrument is outermost so rejected (401) requests are
-	// still counted and logged.
-	s.handler = s.instrument(securityHeaders(s.auth(mux)))
+	// still counted and logged; the device gate sits inside auth so only
+	// visitors with valid credentials (or a share link) ever reach a prompt.
+	s.handler = s.instrument(securityHeaders(s.auth(s.gate(mux))))
+	go s.watchLoop()
 	return s, nil
 }
 
@@ -105,6 +152,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.handler.S
 
 // Dir returns the absolute directory being served.
 func (s *Server) Dir() string { return s.cfg.Dir }
+
+// Inbox returns the absolute upload directory, or "" when uploads are off.
+func (s *Server) Inbox() string { return s.cfg.Inbox }
 
 // Close ends long-lived streams (SSE) so a graceful shutdown isn't held up.
 // The directory handle stays open: transfers still finishing during the
@@ -125,6 +175,10 @@ func (s *Server) instrument(next http.Handler) http.Handler {
 		// Deferred so the entry is written even when a handler aborts the
 		// connection with panic(http.ErrAbortHandler).
 		defer func() {
+			// Credit the device; uploads credit their received bytes themselves.
+			if s.cfg.Devices != nil {
+				s.cfg.Devices.AddTraffic(clientIP(r), rec.Bytes, 0)
+			}
 			if r.URL.Path == "/api/events" {
 				return
 			}
@@ -140,6 +194,40 @@ func (s *Server) instrument(next http.Handler) http.Handler {
 			})
 		}()
 		next.ServeHTTP(rec, r)
+	})
+}
+
+// admitWait is how long a request from a device awaiting approval is held
+// open before the visitor is shown a "waiting" page.
+const admitWait = 20 * time.Second
+
+// gate records every device and refuses blocked ones. With --ask, a new
+// device's requests wait for the operator to allow it in the dashboard.
+func (s *Server) gate(next http.Handler) http.Handler {
+	reg := s.cfg.Devices
+	// No registry: everyone is admitted (tests, embedding).
+	if reg == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch reg.Admit(r.Context(), clientIP(r), r.UserAgent(), admitWait) {
+		case devices.Allowed:
+			next.ServeHTTP(w, r)
+		case devices.Blocked:
+			http.Error(w, "the host has blocked this device", http.StatusForbidden)
+		default:
+			// Still undecided: a browser gets a page that keeps trying, and
+			// scripts get a status they can retry on.
+			if r.Method == http.MethodGet && (r.URL.Path == "/" || strings.HasPrefix(r.URL.Path, "/s/")) {
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.Header().Set("Cache-Control", "no-store")
+				w.WriteHeader(http.StatusForbidden)
+				waitingPage.Execute(w, map[string]any{"Name": brand.Name, "Device": devices.Nickname(r.UserAgent()), "IP": clientIP(r)})
+				return
+			}
+			w.Header().Set("Retry-After", "3")
+			http.Error(w, "waiting for the host to approve this device", http.StatusForbidden)
+		}
 	})
 }
 

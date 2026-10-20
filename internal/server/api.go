@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"math"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Indigo6415/pidgeon/internal/brand"
+	"github.com/Indigo6415/pidgeon/internal/devices"
 	"github.com/Indigo6415/pidgeon/internal/listeners"
 )
 
@@ -56,6 +58,24 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	case s.cfg.BasicUser != "":
 		info["auth"] = "basic"
 	}
+	// Optional features the UI shows only when they are on.
+	if s.inbox != nil {
+		info["inbox"] = true
+		info["inboxMax"] = s.cfg.InboxMax
+		if s.inboxRel != "" {
+			info["inboxPath"] = "/" + s.inboxRel
+		}
+	}
+	if !s.cfg.Expires.IsZero() {
+		info["expires"] = s.cfg.Expires.UnixMilli()
+	}
+	if s.cfg.Once {
+		info["once"] = true
+	}
+	if s.cfg.MaxBytes > 0 {
+		info["maxBytes"] = s.cfg.MaxBytes
+		info["served"] = s.cfg.Store.BytesServed()
+	}
 	writeJSON(w, http.StatusOK, info)
 }
 
@@ -66,22 +86,32 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		httpError(w, err)
 		return
 	}
-	f, err := s.root.Open(name)
+	entries, err := s.list(name)
 	if err != nil {
 		httpError(w, err)
 		return
+	}
+	out := listing{Path: "/", Entries: entries}
+	if name != "." {
+		out.Path = "/" + name
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// list reads one root-relative directory, applying the visibility rules:
+// dotfiles are hidden unless --hidden, symlinks are followed only while they
+// stay inside the served root, and devices, sockets and pipes are left out.
+func (s *Server) list(name string) ([]entry, error) {
+	f, err := s.root.Open(name)
+	if err != nil {
+		return nil, err
 	}
 	defer f.Close()
 	des, err := f.ReadDir(-1)
 	if err != nil {
-		httpError(w, err)
-		return
+		return nil, err
 	}
-
-	out := listing{Path: "/", Entries: make([]entry, 0, len(des))}
-	if name != "." {
-		out.Path = "/" + name
-	}
+	out := make([]entry, 0, len(des))
 	// Build a row per entry, following symlinks only while they stay inside
 	// the served root (os.Root.Stat refuses ones that escape).
 	for _, de := range des {
@@ -111,9 +141,35 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 			e.Size = fi.Size()
 		}
 		e.MTime = fi.ModTime().UnixMilli()
-		out.Entries = append(out.Entries, e)
+		out = append(out, e)
 	}
-	writeJSON(w, http.StatusOK, out)
+	return out, nil
+}
+
+// Entry is one item of a folder, for the dashboard's file picker.
+type Entry struct {
+	Name string
+	Dir  bool
+	Size int64
+}
+
+// Browse lists a folder of the served directory ("/" or "/a/b") with the
+// same visibility rules as the web UI.
+func (s *Server) Browse(p string) ([]Entry, error) {
+	name, err := s.resolve(p)
+	if err != nil {
+		return nil, err
+	}
+	es, err := s.list(name)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Entry, len(es))
+	// Copy into the exported shape.
+	for i, e := range es {
+		out[i] = Entry{Name: e.Name, Dir: e.Dir, Size: e.Size}
+	}
+	return out, nil
 }
 
 // peekInfo summarises one folder for the web UI without a full listing.
@@ -263,10 +319,13 @@ type progressItem struct {
 	State string  `json:"state"`
 }
 
-// handleEvents is a Server-Sent Events stream reporting server-side progress
-// of this browser's downloads. Browsers save downloads straight to disk and
-// expose no progress to the page, but the server knows exactly how many
-// bytes it has sent, so it reports them here keyed by the download ID.
+// handleEvents is a Server-Sent Events stream, one per open tab. It reports
+// server-side progress of this browser's downloads as unnamed messages:
+// browsers save downloads straight to disk and expose no progress to the
+// page, but the server knows exactly how many bytes it has sent, so it
+// reports them here keyed by the download ID. Named events carry everything
+// else: "change" when the folder the tab shows changes on disk, and "send"
+// when the operator sends this device a file from the dashboard.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	cid := r.URL.Query().Get("c")
 	if !clientIDPattern.MatchString(cid) {
@@ -281,6 +340,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("retry: 2000\n\n"))
 	rc.Flush()
+
+	sub := s.subscribe(cid, clientIP(r))
+	defer s.unsubscribe(sub)
 
 	drain := listeners.DrainFromContext(r.Context())
 	tick := time.NewTicker(400 * time.Millisecond)
@@ -299,7 +361,18 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-s.done:
 			return
+		case ev := <-sub.ch:
+			// Named events go out as soon as they happen.
+			if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.name, ev.data); err != nil {
+				return
+			}
+			rc.Flush()
+			continue
 		case <-tick.C:
+		}
+		// A device blocked from the dashboard loses its live feed too.
+		if s.cfg.Devices != nil && s.cfg.Devices.Status(sub.ip) == devices.Blocked {
+			return
 		}
 		views := s.cfg.Store.TransfersByDLPrefix(prefix)
 		items := make([]progressItem, len(views))

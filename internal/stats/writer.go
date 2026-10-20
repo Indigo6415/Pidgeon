@@ -2,6 +2,7 @@ package stats
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 )
@@ -102,3 +103,23 @@ func (w *CountingWriter) Flush() {
 
 // Unwrap lets http.ResponseController reach the real writer.
 func (w *CountingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// CountingReader credits bytes read from a request body (an upload) to a
+// transfer and to the store's received total, failing fast if cancelled.
+type CountingReader struct {
+	R     io.Reader
+	T     *Transfer
+	Store *Store
+}
+
+// Read reads from the body and counts what arrived.
+func (r *CountingReader) Read(p []byte) (int, error) {
+	// A cancel from the dashboard stops the upload at the next read.
+	if r.T.Cancelled() {
+		return 0, ErrCancelled
+	}
+	n, err := r.R.Read(p)
+	r.T.Add(n)
+	r.Store.AddReceived(n)
+	return n, err
+}
