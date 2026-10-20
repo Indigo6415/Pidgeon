@@ -62,9 +62,12 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	if s.inbox != nil {
 		info["inbox"] = true
 		info["inboxMax"] = s.cfg.InboxMax
-		if s.inboxRel != "" {
-			info["inboxPath"] = "/" + s.inboxRel
+		if p := s.inboxPath(); p != "" {
+			info["inboxPath"] = p
 		}
+	}
+	if s.cfg.Devices != nil && s.cfg.Devices.Ask() {
+		info["ask"] = true
 	}
 	if !s.cfg.Expires.IsZero() {
 		info["expires"] = s.cfg.Expires.UnixMilli()

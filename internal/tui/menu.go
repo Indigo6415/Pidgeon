@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -13,6 +14,7 @@ type menuItem struct {
 	hint     string // short explanation shown after the label
 	danger   bool   // drawn in the error colour (quit, cancel)
 	disabled bool   // shown dimmed and skipped by the cursor
+	key      string // optional one-key shortcut while the menu is open ("y", "n")
 	run      func() tea.Cmd
 }
 
@@ -20,9 +22,22 @@ type menuItem struct {
 // dashboard action is reachable without memorising letter shortcuts.
 type menu struct {
 	title string
+	note  []string // optional lines of context shown above the items
 	items []menuItem
 	cur   int
+
+	// back, if set, handles ← instead of closing the menu (the file
+	// picker uses it to go up a folder).
+	back func() tea.Cmd
+	// prompt is the approval this menu answers, 0 for ordinary menus.
+	prompt uint64
 }
+
+// menuRows is how many items a menu shows at once; longer menus scroll.
+const menuRows = 14
+
+// menuMaxWidth caps a menu's width so long file names don't fill the screen.
+const menuMaxWidth = 72
 
 // newMenu builds a menu with the cursor on the first enabled item.
 func newMenu(title string, items ...menuItem) *menu {
@@ -51,9 +66,20 @@ func (m *menu) selected() (menuItem, bool) {
 	return m.items[m.cur], true
 }
 
+// shortcut returns the enabled item bound to key k, if any.
+func (m *menu) shortcut(k string) (menuItem, bool) {
+	// Shortcuts are few; scan them all.
+	for _, it := range m.items {
+		if it.key != "" && it.key == k && !it.disabled {
+			return it, true
+		}
+	}
+	return menuItem{}, false
+}
+
 // view renders the menu as a bordered box.
 func (m *menu) view(th theme) string {
-	rows := make([]string, 0, len(m.items)+2)
+	rows := make([]string, 0, min(len(m.items), menuRows)+len(m.note)+4)
 	width := max(34, lipgloss.Width(m.title)+8)
 	// Measure first so every row can be padded to the same width.
 	for _, it := range m.items {
@@ -61,10 +87,34 @@ func (m *menu) view(th theme) string {
 		if it.hint != "" {
 			w += 2 + lipgloss.Width(it.hint)
 		}
+		if it.key != "" {
+			w += 4
+		}
 		width = max(width, w+4)
 	}
+	for _, n := range m.note {
+		width = max(width, lipgloss.Width(n)+4)
+	}
+	width = min(width, menuMaxWidth)
+	// Context lines first, separated from the choices by a blank line.
+	for _, n := range m.note {
+		rows = append(rows, fgs(th.muted).Render(n))
+	}
+	if len(m.note) > 0 {
+		rows = append(rows, "")
+	}
+	// Long menus show a window around the cursor.
+	start, end := 0, len(m.items)
+	if len(m.items) > menuRows {
+		start = min(max(0, m.cur-menuRows/2), len(m.items)-menuRows)
+		end = start + menuRows
+		if start > 0 {
+			rows = append(rows, fgs(th.faint).Render(fmt.Sprintf("  ↑ %d more", start)))
+		}
+	}
 	// One row per item; the cursor row is highlighted.
-	for i, it := range m.items {
+	for i := start; i < end; i++ {
+		it := m.items[i]
 		st := fgs(th.fg)
 		switch {
 		case it.disabled:
@@ -81,12 +131,22 @@ func (m *menu) view(th theme) string {
 			}
 		}
 		row := prefix + st.Render(it.label)
+		if it.key != "" {
+			row += fgs(th.faint).Render(" (" + it.key + ")")
+		}
 		if it.hint != "" {
 			row += "  " + fgs(th.muted).Render(it.hint)
 		}
 		rows = append(rows, row)
 	}
-	rows = append(rows, "", fgs(th.faint).Render(strings.Join([]string{"↑↓ choose", "enter select", "esc back"}, " · ")))
+	if end < len(m.items) {
+		rows = append(rows, fgs(th.faint).Render(fmt.Sprintf("  ↓ %d more", len(m.items)-end)))
+	}
+	help := []string{"↑↓ choose", "enter select", "esc back"}
+	if m.back != nil {
+		help = []string{"↑↓ choose", "enter open", "← up", "esc close"}
+	}
+	rows = append(rows, "", fgs(th.faint).Render(strings.Join(help, " · ")))
 	return th.panel(m.title, rows, width, true)
 }
 

@@ -9,6 +9,8 @@
 // only approach that works for large files on phones. The page can't see a
 // native download's progress, so each download URL carries an ID
 // (?dl=<client>.<n>) and /api/events reports the bytes the server has sent.
+// The same event stream tells the page when the folder it shows changes on
+// disk, and delivers files the host sends from the terminal dashboard.
 
 const $ = (sel, el = document) => el.querySelector(sel);
 const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
@@ -34,6 +36,9 @@ const state = {
   cache: new Map(),        // path -> { entries, at } recent listings, oldest first
   peek: new Map(),         // folder path -> { items, dirs } from /api/peek
   win: null,               // [first, last) row indices currently in the DOM
+  fresh: new Set(),        // names that just appeared in this folder (highlighted)
+  reveal: null,            // name to put the cursor on once the next folder shows
+  zipStore: loadJSON("zipStore", false), // never compress ZIPs: exact size, resumable
 };
 
 const clientId = getClientId();
@@ -146,7 +151,6 @@ const NAMED = { dockerfile: ["DK", "blue"], makefile: ["MK", "orange"], license:
 const EXT_MEDIA = {};
 // Invert the media table: extension -> type.
 for (const [t, exts] of Object.entries(MEDIA)) for (const e of exts.split(" ")) EXT_MEDIA[e] = t;
-const PREVIEWABLE = new Set(["image", "video", "audio", "pdf", "code"]);
 
 /** Classifies an entry: { kind, html } where html is its 16px icon. */
 function fileIcon(e) {
@@ -363,6 +367,7 @@ async function load(path, { force = false } = {}) {
   renderCrumbs();
   revealInTree(path);
   closeDrawer();
+  watchFolder(path);
   // A refresh also forgets what we knew about the subfolders.
   if (force) for (const p of state.peek.keys()) if (parentOf(p) === path && p !== path) state.peek.delete(p);
 
@@ -398,6 +403,12 @@ function showEntries(entries, from) {
   if (parentOf(from) === state.path && from !== state.path) {
     const i = state.view.findIndex((e) => e.name === from.slice(from.lastIndexOf("/") + 1));
     if (i >= 0) setCursor(i);
+  }
+  // Arriving from a search result: select the file that was picked.
+  if (state.reveal) {
+    const i = state.view.findIndex((e) => e.name === state.reveal);
+    state.reveal = null;
+    if (i >= 0) { setCursor(i); selectRange(i, i); state.anchor = i; selectionChanged(); }
   }
   if (!touch && !document.activeElement?.matches("input")) $("#list").focus({ preventScroll: true });
 }
@@ -580,9 +591,9 @@ function rowHTML(i) {
   const fi = fileIcon(e);
   const p = join(state.path, e.name);
   const sel = state.sel.has(e.name);
-  const preview = !e.dir && PREVIEWABLE.has(fi.kind)
+  const preview = previewKind(e)
     ? `<a class="icon-btn act-preview" href="/f${esc(encPath(p))}?inline=1" target="_blank" rel="noopener" title="Open Preview" aria-label="Preview ${esc(e.name)}">${icon("i-eye")}</a>` : "";
-  return `<li class="row${e.dir ? " dir" : ""}${sel ? " sel" : ""}${i === state.cursor ? " cursor" : ""}" data-i="${i}" role="option" aria-selected="${sel}">
+  return `<li class="row${e.dir ? " dir" : ""}${sel ? " sel" : ""}${i === state.cursor ? " cursor" : ""}${state.fresh.has(e.name) ? " fresh" : ""}" data-i="${i}" role="option" aria-selected="${sel}">
     <label class="cb"><input type="checkbox" tabindex="-1" ${sel ? "checked" : ""} aria-label="Select ${esc(e.name)}"><span></span></label>
     <span class="name-cell">${fi.html}<span class="meta"><span class="name">${esc(e.name)}</span><span class="sub">${esc(rowSub(e))}</span></span></span>
     <span class="size">${e.dir ? esc(folderSize(e)) : fmtBytes(e.size)}</span>
@@ -907,9 +918,10 @@ async function downloadZip(names) {
     const r = await api("/api/zip", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ base: state.path, paths: names }),
+      body: JSON.stringify({ base: state.path, paths: names, store: state.zipStore }),
     });
-    startDownload({ name: r.name, url: r.url, kind: "zip", total: -1, entry: { name: r.name } });
+    // Stored archives have an exact size: a real progress bar, and resumable.
+    startDownload({ name: r.name, url: r.url, kind: "zip", total: r.size >= 0 ? r.size : -1, entry: { name: r.name } });
   } catch (err) {
     note("Couldn't start the ZIP: " + err.message, "err");
   }
@@ -919,12 +931,14 @@ async function downloadZip(names) {
 /* downloads panel                                                    */
 /* ------------------------------------------------------------------ */
 
-let events = null, eventsIdle = null;
-/** Opens the progress stream while any download is unfinished. */
+let events = null;
+/** Opens the event stream (kept open for the life of the page): download
+ *  progress as plain messages, plus named "change" and "send" events. */
 function ensureEvents() {
-  clearTimeout(eventsIdle);
   if (events) return;
   events = new EventSource("/api/events?c=" + encodeURIComponent(clientId));
+  // (Re)connected: tell the server which folder to watch for this tab.
+  events.onopen = () => watchFolder(state.path);
   events.onmessage = (ev) => {
     let items;
     try { items = JSON.parse(ev.data); } catch { return; }
@@ -939,15 +953,44 @@ function ensureEvents() {
       d.state = it.state === "active" ? "active" : it.state === "done" ? "done" : "failed";
     }
     renderDownloads();
-    maybeCloseEvents();
   };
+  events.addEventListener("change", (ev) => { try { folderChanged(JSON.parse(ev.data)); } catch {} });
+  events.addEventListener("send", (ev) => { try { showSendNote(JSON.parse(ev.data)); } catch {} });
 }
 
-/** Closes the stream a few seconds after everything has finished. */
-function maybeCloseEvents() {
-  const pending = [...state.downloads.values()].some((d) => d.state === "queued" || d.state === "active");
-  clearTimeout(eventsIdle);
-  if (!pending && events) eventsIdle = setTimeout(() => { events?.close(); events = null; }, 5000);
+/** Kept for the panel's dismiss button; the stream now stays open. */
+function maybeCloseEvents() {}
+
+/* live folder: the server polls the folder this tab shows and pushes a
+   "change" event when something is added, removed or modified */
+
+/** Tells the server which folder this tab is showing. */
+function watchFolder(path) {
+  if (!events || events.readyState !== EventSource.OPEN) return;
+  const q = new URLSearchParams({ c: clientId, path });
+  fetch("/api/watch?" + q, { method: "POST" }).catch(() => {});
+}
+
+/** Applies a change pushed by the server: refetch, then flash what's new. */
+async function folderChanged(c) {
+  // Any cached copy of that folder is stale now.
+  state.cache.delete(c.path);
+  if (c.path !== state.path) return;
+  if (c.gone) { load(state.path, { force: true }); return; }
+  for (const n of c.added) state.fresh.add(n);
+  try {
+    const entries = await fetchListing(c.path);
+    if (c.path === state.path) { refreshEntries(entries); scheduleTree(); }
+  } catch {}
+  // New rows glow briefly, then settle.
+  if (c.added.length) {
+    clearTimeout(folderChanged.t);
+    folderChanged.t = setTimeout(() => {
+      state.fresh.clear();
+      document.querySelectorAll("#list .row.fresh").forEach((r) => r.classList.remove("fresh"));
+    }, 2600);
+    if (document.hidden || c.added.length > 1) note(`${c.added.length} new item${c.added.length > 1 ? "s" : ""} in this folder`);
+  }
 }
 
 /** Renders the downloads panel, the top-bar badge and the status-bar item. */
@@ -960,8 +1003,9 @@ function renderDownloads() {
   $("#dl-badge").textContent = active.length;
   const sb = $("#sb-dl");
   sb.classList.toggle("busy", active.length > 0);
+  const ups = active.filter((d) => d.kind === "upload").length;
   $("#sb-dl-text").textContent = active.length
-    ? `${active.length} downloading · ${fmtBytes(rate)}/s`
+    ? `${ups === active.length ? `${ups} uploading` : ups ? `${active.length} transfers` : `${active.length} downloading`} · ${fmtBytes(rate)}/s`
     : list.length ? `${list.length} download${list.length > 1 ? "s" : ""}` : "No downloads";
   $("#panel-meta").textContent = active.length ? `${active.length} active · ${fmtBytes(rate)}/s` : "";
 
@@ -970,11 +1014,15 @@ function renderDownloads() {
     const pct = d.total > 0 ? Math.min(100, (d.sent / d.total) * 100) : 0;
     switch (d.state) {
       case "queued":
-        info = (Date.now() - d.added) / 1000 > 15 ? "waiting for browser…" : "starting…";
+        info = d.kind === "upload" ? "queued" : (Date.now() - d.added) / 1000 > 15 ? "waiting for browser…" : "starting…";
         prog = `<div class="prog queued"><i></i></div>`;
         break;
       case "active":
-        if (d.total > 0) {
+        // With --ask, an upload sits unread until the host accepts it.
+        if (d.kind === "upload" && state.info.ask && !d.rate && d.sent < d.total && Date.now() - d.lastProgress > 1500) {
+          info = "waiting for the host to accept…";
+          prog = `<div class="prog queued"><i></i></div>`;
+        } else if (d.total > 0) {
           const eta = d.rate > 0 ? fmtDur((d.total - d.sent) / d.rate) : "";
           info = `${pct.toFixed(0)}% · ${fmtBytes(d.sent)}/${fmtBytes(d.total)} · ${fmtBytes(d.rate)}/s${eta ? " · " + eta : ""}`;
           prog = `<div class="prog"><i style="width:${pct.toFixed(1)}%"></i></div>`;
@@ -984,15 +1032,16 @@ function renderDownloads() {
         }
         break;
       case "done":
-        info = `<span class="ok">✓</span> ${fmtBytes(d.sent)}`;
+        info = d.kind === "upload" ? `<span class="ok">✓</span> sent · saved as ${esc(d.savedAs || d.name)}` : `<span class="ok">✓</span> ${fmtBytes(d.sent)}`;
         prog = `<div class="prog done"><i></i></div>`;
         break;
       default:
-        info = `<span class="bad">✕ interrupted</span> at ${fmtBytes(d.sent)}`;
+        info = d.error ? `<span class="bad">✕ ${esc(d.error)}</span>` : `<span class="bad">✕ interrupted</span> at ${fmtBytes(d.sent)}`;
         prog = `<div class="prog failed"><i></i></div>`;
     }
+    const ic = d.kind === "upload" ? `<span class="fi t-up">${icon("i-upload")}</span>` : fileIcon(d.entry || { name: d.name }).html;
     return `<li class="dl ${d.state}" data-id="${esc(d.id)}">
-      ${fileIcon(d.entry || { name: d.name }).html}
+      ${ic}
       <span class="dl-name" title="${esc(d.name)}">${esc(d.name)}</span>
       ${prog}<span class="dl-info">${info}</span>
       <button class="icon-btn dl-x" title="Dismiss" aria-label="Dismiss">${icon("i-x")}</button>
@@ -1051,7 +1100,7 @@ function makeSash(el, varName, { axis, min, max, invert }) {
 /* command palette                                                    */
 /* ------------------------------------------------------------------ */
 
-const pal = { items: [], active: 0 };
+const pal = { items: [], active: 0, sepAt: -1, sepText: "" };
 
 /** The commands available from "> ". */
 function commands() {
@@ -1068,6 +1117,10 @@ function commands() {
     { label: "View: List", run: () => setLayout("list") },
     { label: "View: Grid", run: () => setLayout("grid") },
     { label: "Downloads: Clear Finished", run: clearFinished },
+    { label: `ZIP: ${state.zipStore ? "Compress Again (smaller, no resume)" : "Always Store (exact size, resumable)"}`, run: toggleZipStore },
+    { label: "Open Preview", key: "⇧Space", run: () => { const e = state.view[state.cursor]; e && previewKind(e) ? openPreview(e) : note("Nothing to preview here"); } },
+    { label: "Share This Folder…", run: () => openShareDialog({ name: state.path === "/" ? state.info.root || "Files" : state.path.slice(state.path.lastIndexOf("/") + 1), dir: true }, state.path) },
+    ...(state.info.inbox ? [{ label: "Send Files to This Computer…", run: pickUploads }] : []),
     { label: "Preferences: Color Theme: Dark Modern", run: () => setTheme("dark", true) },
     { label: "Preferences: Color Theme: Light Modern", run: () => setTheme("light", true) },
     { label: "Preferences: Color Theme: Follow System", run: () => setTheme("auto", true) },
@@ -1090,6 +1143,7 @@ function openPalette(prefix = "") {
 /** Closes the palette and returns focus to the list. */
 function closePalette() {
   $("#palette").hidden = true;
+  stopSearch();
   if (!touch) $("#list").focus({ preventScroll: true });
 }
 
@@ -1107,8 +1161,9 @@ function fuzzy(text, q) {
   return j === lq.length ? out : null;
 }
 
-/** Rebuilds the palette's result list from the input. */
-function renderPalette() {
+/** Rebuilds the palette's result list from the input. keep holds the
+ *  highlighted item in place (used while search results stream in). */
+function renderPalette(keep = false) {
   const raw = $("#pal-input").value;
   const isCmd = raw.startsWith(">");
   const q = (isCmd ? raw.slice(1) : raw).trim();
@@ -1128,16 +1183,100 @@ function renderPalette() {
       pal.items.push({ html: h, desc: e.dir ? "folder" : fmtBytes(e.size), iconHtml: fileIcon(e).html, run: () => openEntry(e) });
       if (pal.items.length > 200) break;
     }
+    // Then matches from everywhere else, streamed in by the server.
+    pal.sepAt = -1;
+    if (q) {
+      startSearch(q);
+      const hits = rankHits(search.hits.filter((h) => parentOf(h.path) !== state.path), q).slice(0, 100);
+      if (hits.length || !search.done) {
+        pal.sepAt = pal.items.length;
+        pal.sepText = !search.done ? "Other folders · searching…" : search.partial ? "Other folders · first matches" : "Other folders";
+      }
+      for (const h of hits) {
+        const name = h.path.slice(h.path.lastIndexOf("/") + 1);
+        const e = { name, dir: !!h.dir, size: h.size, mtime: h.mtime };
+        pal.items.push({
+          html: fuzzy(name, q) ?? esc(name), desc: parentOf(h.path).slice(1) || "/", iconHtml: fileIcon(e).html,
+          // A folder opens; a file is revealed (and selected) in its folder.
+          run: () => { if (e.dir) go(h.path); else { state.reveal = name; go(parentOf(h.path)); } },
+        });
+      }
+    } else stopSearch();
   }
-  pal.active = 0;
+  pal.active = keep ? Math.min(pal.active, Math.max(0, pal.items.length - 1)) : 0;
   const list = $("#pal-list");
   if (!pal.items.length) {
-    list.innerHTML = `<li class="pal-empty">${isCmd ? "No matching commands" : "No matching files in this folder — type > for commands"}</li>`;
+    const msg = isCmd ? "No matching commands" : q && !search.done ? "Searching every folder…" : q ? "No matching files or folders — type > for commands" : "This folder is empty — type > for commands";
+    list.innerHTML = `<li class="pal-empty">${msg}</li>`;
     return;
   }
-  list.innerHTML = pal.items.map((it, i) => `<li class="pal-item${i === 0 ? " active" : ""}" data-i="${i}" role="option">
+  list.innerHTML = pal.items.map((it, i) => (i === pal.sepAt ? `<li class="pal-sep">${esc(pal.sepText)}</li>` : "") + `<li class="pal-item${i === pal.active ? " active" : ""}" data-i="${i}" role="option">
     ${it.iconHtml || ""}<span class="lbl">${it.html}</span>${it.desc ? `<span class="desc">${esc(it.desc)}</span>` : ""}${it.key ? `<span class="key">${esc(it.key)}</span>` : ""}
-  </li>`).join("");
+  </li>`).join("") + (pal.sepAt === pal.items.length ? `<li class="pal-sep">${esc(pal.sepText)}</li>` : "");
+}
+
+/* tree-wide quick open: /api/search streams matches (newline-delimited
+   JSON) while it walks the tree breadth-first */
+
+let search = { q: "", hits: [], done: true, partial: false, ctrl: null, timer: 0 };
+
+/** Starts searching for q (debounced), unless that search is already running. */
+function startSearch(q) {
+  if (search.q === q) return;
+  stopSearch();
+  search = { q, hits: [], done: false, partial: false, ctrl: new AbortController(), timer: 0 };
+  const s = search;
+  s.timer = setTimeout(() => runSearch(s), 140);
+}
+
+/** Abandons the current search. */
+function stopSearch() {
+  clearTimeout(search.timer);
+  search.ctrl?.abort();
+  search = { q: "", hits: [], done: true, partial: false, ctrl: null, timer: 0 };
+}
+
+/** Reads the result stream, repainting the palette as hits arrive. */
+async function runSearch(s) {
+  let frame = 0;
+  const repaint = () => { if (!frame) frame = requestAnimationFrame(() => { frame = 0; if (search === s && !$("#palette").hidden) renderPalette(true); }); };
+  try {
+    const r = await fetch("/api/search?q=" + encodeURIComponent(s.q), { signal: s.ctrl.signal });
+    if (!r.ok) throw new Error(r.statusText);
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    // Split the stream into lines; each one is a hit or the final summary.
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        const o = JSON.parse(line);
+        if (o.done) s.partial = o.partial; else s.hits.push(o);
+      }
+      repaint();
+    }
+  } catch (err) {
+    if (err.name === "AbortError") return;
+  }
+  s.done = true;
+  repaint();
+}
+
+/** Orders search hits: exact name, prefix, substring, then looser matches;
+ *  shallower paths first within each group. */
+function rankHits(hits, q) {
+  const lq = q.toLowerCase();
+  const score = (h) => {
+    const n = h.path.slice(h.path.lastIndexOf("/") + 1).toLowerCase();
+    const base = n === lq ? 0 : n.startsWith(lq) ? 1 : n.includes(lq) ? 2 : 3;
+    return base * 1000 + h.path.split("/").length * 10 + (h.dir ? 0 : 1);
+  };
+  return hits.map((h) => [score(h), h]).sort((a, b) => a[0] - b[0] || coll.compare(a[1].path, b[1].path)).map((x) => x[1]);
 }
 
 /** Moves the palette highlight. */
@@ -1170,13 +1309,15 @@ function showContextMenu(ev, i) {
   const items = many
     ? [{ label: `Download ${state.sel.size} Items as ZIP`, run: downloadSelection }]
     : e.dir
-      ? [{ label: "Open", run: () => openEntry(e) }, { label: "Download as ZIP", run: () => downloadZip([e.name]) }, "-", { label: "Copy Link", run: () => copyText(entryURL(e), "link") }]
+      ? [{ label: "Open", run: () => openEntry(e) }, { label: "Download as ZIP", run: () => downloadZip([e.name]) }, "-",
+        { label: "Copy Link", run: () => copyText(entryURL(e), "link") }, { label: "Create Share Link…", run: () => openShareDialog(e, join(state.path, e.name)) }]
       : [
         { label: "Download", run: () => downloadFile(e) },
-        ...(PREVIEWABLE.has(fileIcon(e).kind) ? [{ label: "Open Preview", run: () => open("/f" + encPath(join(state.path, e.name)) + "?inline=1", "_blank", "noopener") }] : []),
+        ...(previewKind(e) ? [{ label: "Open Preview", key: "⇧Space", run: () => openPreview(e) }] : []),
         "-",
         { label: "Copy Link", run: () => copyText(entryURL(e), "link") },
         { label: "Copy as cURL", run: () => copyText(curlFor(e), "curl command") },
+        { label: "Create Share Link…", run: () => openShareDialog(e, join(state.path, e.name)) },
       ];
   items.push("-", { label: "Select All", key: `${MOD}A`, run: () => { selectRange(0, state.view.length - 1); selectionChanged(); } });
 
@@ -1201,8 +1342,446 @@ function showContextMenu(ev, i) {
 const closeContextMenu = () => $("#ctx")?.remove();
 
 /* ------------------------------------------------------------------ */
+/* preview                                                            */
+/* ------------------------------------------------------------------ */
+
+const pv = { list: [], i: 0, kind: "", ctrl: null, md: "rendered", wrap: false };
+const TEXT_LIMIT = 256 * 1024; // bytes of a text file loaded at once
+const PLAIN = new Set(["txt", "log", "csv", "tsv", "lock"]);
+
+/** What kind of preview an entry gets, or "" if none. */
+function previewKind(e) {
+  if (!e || e.dir) return "";
+  const ext = extOf(e.name);
+  // SVG renders as an image; inside <img> its scripts never run.
+  if (ext === "svg") return "image";
+  const k = fileIcon(e).kind;
+  if (k === "code") return ext === "md" || ext === "mdx" ? "markdown" : "text";
+  return ["image", "video", "audio", "pdf"].includes(k) ? k : "";
+}
+
+/** Lower-case extension of a file name ("" if none). */
+const extOf = (name) => { const d = name.lastIndexOf("."); return d > 0 ? name.slice(d + 1).toLowerCase() : ""; };
+
+/** Opens the preview on e; ← and → step through the folder's other
+ *  previewable files. e may carry its own path (a file sent from the host). */
+function openPreview(e) {
+  if (e.path && parentOf(e.path) !== state.path) pv.list = [e];
+  else {
+    pv.list = state.view.filter((x) => previewKind(x)).map((x) => ({ ...x, path: join(state.path, x.name) }));
+  }
+  pv.i = Math.max(0, pv.list.findIndex((x) => x.name === e.name));
+  if (!pv.list.length) pv.list = [{ ...e, path: e.path || join(state.path, e.name) }];
+  $("#preview").hidden = false;
+  closeContextMenu();
+  renderPreview();
+  $("#pv-close").focus({ preventScroll: true });
+}
+
+/** Closes the preview, stopping any playback. */
+function closePreview() {
+  pv.ctrl?.abort();
+  $("#pv-body").innerHTML = "";
+  $("#preview").hidden = true;
+  // Leave the cursor on the file that was being looked at.
+  const e = pv.list[pv.i];
+  const i = e ? state.view.findIndex((x) => x.name === e.name) : -1;
+  if (i >= 0 && e.path === join(state.path, e.name)) setCursor(i);
+  if (!touch) $("#list").focus({ preventScroll: true });
+}
+
+/** Moves to the previous/next previewable file. */
+function stepPreview(d) {
+  if (pv.list.length < 2) return;
+  pv.i = (pv.i + d + pv.list.length) % pv.list.length;
+  renderPreview();
+}
+
+/** Draws the current file. */
+function renderPreview() {
+  pv.ctrl?.abort();
+  pv.ctrl = null;
+  const e = pv.list[pv.i];
+  const kind = (pv.kind = previewKind(e));
+  const url = "/f" + encPath(e.path) + "?inline=1";
+  $("#pv-icon").innerHTML = fileIcon(e).html;
+  $("#pv-name").textContent = e.name;
+  $("#pv-meta").textContent = [fmtBytes(e.size), e.mtime ? fmtDate(e.mtime) : "", pv.list.length > 1 ? `${pv.i + 1} of ${pv.list.length}` : ""].filter(Boolean).join(" · ");
+  $("#pv-open").href = url;
+  $("#pv-prev").hidden = $("#pv-next").hidden = pv.list.length < 2;
+  $("#pv-tools").innerHTML = "";
+  const body = $("#pv-body");
+  body.className = "pv-body pv-" + kind;
+  const fail = (msg) => {
+    body.className = "pv-body pv-msg";
+    body.innerHTML = `${icon("i-eye", "i big")}<h3>${esc(msg)}</h3><button class="btn primary" id="pv-fallback">${icon("i-download")}<span>Download</span></button>`;
+    $("#pv-fallback").onclick = () => $("#pv-dl").click();
+  };
+  switch (kind) {
+    case "image":
+      body.innerHTML = `<img src="${esc(url)}" alt="${esc(e.name)}">`;
+      $("img", body).onerror = () => fail("This browser can't show this image");
+      break;
+    case "video":
+      body.innerHTML = `<video src="${esc(url)}" controls autoplay playsinline></video>`;
+      $("video", body).onerror = () => fail("This browser can't play this video");
+      break;
+    case "audio":
+      body.innerHTML = `<div class="pv-audio">${fileIcon(e).html}<audio src="${esc(url)}" controls autoplay></audio></div>`;
+      break;
+    case "pdf":
+      body.innerHTML = `<iframe src="${esc(url)}" title="${esc(e.name)}"></iframe>`;
+      break;
+    default:
+      loadText(e, url, false);
+  }
+}
+
+/** Loads (part of) a text file and shows it as code or rendered Markdown.
+ *  Big files show their first 256 KB, or with tail set their last 256 KB. */
+async function loadText(e, url, tail) {
+  const body = $("#pv-body");
+  body.innerHTML = `<div class="pv-loading">Loading…</div>`;
+  const ctrl = (pv.ctrl = new AbortController());
+  const big = e.size > TEXT_LIMIT;
+  const headers = big ? { Range: tail ? `bytes=-${TEXT_LIMIT}` : `bytes=0-${TEXT_LIMIT - 1}` } : {};
+  let text;
+  try {
+    const r = await fetch(url, { headers, signal: ctrl.signal });
+    if (!r.ok && r.status !== 206) throw new Error(r.statusText);
+    const buf = new Uint8Array(await r.arrayBuffer());
+    // NUL bytes near the start mean it isn't text after all.
+    if (buf.subarray(0, 8192).includes(0)) throw new Error("binary");
+    text = new TextDecoder().decode(buf);
+  } catch (err) {
+    if (err.name === "AbortError") return;
+    body.className = "pv-body pv-msg";
+    body.innerHTML = `${icon("i-eye", "i big")}<h3>${err.message === "binary" ? "This looks like a binary file" : "Couldn't load this file"}</h3>`;
+    return;
+  }
+  if (pv.ctrl !== ctrl) return;
+  // A tail starts mid-line; drop the partial first line.
+  if (tail && big) text = text.slice(text.indexOf("\n") + 1);
+  const ext = extOf(e.name);
+  const md = pv.kind === "markdown";
+
+  // Toolbar: Markdown can switch to its source; code can wrap long lines.
+  const tools = $("#pv-tools");
+  tools.innerHTML = md
+    ? `<button class="pv-tool${pv.md === "rendered" ? " on" : ""}" data-md="rendered">Preview</button><button class="pv-tool${pv.md === "source" ? " on" : ""}" data-md="source">Source</button>`
+    : `<button class="pv-tool${pv.wrap ? " on" : ""}" data-wrap>Wrap</button>`;
+  tools.onclick = (ev) => {
+    const b = ev.target.closest(".pv-tool");
+    if (!b) return;
+    if (b.dataset.md) pv.md = b.dataset.md; else pv.wrap = !pv.wrap;
+    loadText(e, url, tail);
+  };
+
+  let html = "";
+  // A banner explains a partial view and offers the other end.
+  if (big) {
+    html += `<div class="pv-banner">Showing the ${tail ? "last" : "first"} ${fmtBytes(TEXT_LIMIT)} of ${fmtBytes(e.size)}
+      <button class="btn secondary" id="pv-other">${tail ? "Show start" : "Show end"}</button></div>`;
+  }
+  if (md && pv.md === "rendered") html += `<article class="md">${renderMarkdown(text, parentOf(e.path))}</article>`;
+  else {
+    const lines = text.split("\n").length;
+    const nums = tail && big ? "" : Array.from({ length: lines }, (_, i) => i + 1).join("\n");
+    const code = PLAIN.has(ext) ? esc(text) : highlight(text, ext || e.name.toLowerCase());
+    html += `<div class="pv-code${pv.wrap ? " wrap" : ""}">${nums ? `<pre class="gutter" aria-hidden="true">${nums}</pre>` : ""}<pre class="src"><code>${code}</code></pre></div>`;
+  }
+  body.className = "pv-body pv-text";
+  body.innerHTML = html;
+  if (big) $("#pv-other").onclick = () => loadText(e, url, !tail);
+}
+
+/* a small, safe syntax highlighter: comments, strings, numbers, keywords and
+   calls, which is most of what makes code readable at a glance */
+
+const KEYWORDS = new Set(`abstract and as async await break case catch class const continue def default defer del do elif else enum except
+  export extends false final finally fn for from func function go goto if impl import in instanceof interface is lambda let loop match mod
+  module mut namespace new nil none not null of or package pass private protected pub public raise return select self static struct super
+  switch then this throw throws true try type typeof undefined unless use using var void when where while with yield fi done esac local
+  echo True False None`.split(/\s+/));
+const HASH_COMMENTS = new Set(["py", "sh", "bash", "zsh", "fish", "rb", "yaml", "yml", "toml", "ini", "r", "pl", "ps1", "tf", "env",
+  "dockerfile", "makefile", ".gitignore", "gitignore", "conf", "properties", "ex", "exs", "nim"]);
+
+/** Returns src as HTML with token classes for the language of ext. */
+function highlight(src, ext) {
+  const hash = HASH_COMMENTS.has(ext);
+  const re = hash
+    ? /(#[^\n]*)|("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')|(\b\d[\w.]*)|([A-Za-z_$][\w$]*)/g
+    : /(\/\/[^\n]*|\/\*[\s\S]*?\*\/|<!--[\s\S]*?-->)|("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`)|(\b\d[\w.]*)|([A-Za-z_$][\w$]*)/g;
+  let out = "", last = 0, m;
+  // Walk the tokens; everything between them is copied escaped.
+  while ((m = re.exec(src))) {
+    out += esc(src.slice(last, m.index));
+    const [t, com, str, num, id] = m;
+    let cls = "";
+    if (com) cls = "c";
+    else if (str) cls = "s";
+    else if (num) cls = "n";
+    else if (KEYWORDS.has(id)) cls = "k";
+    else if (src[re.lastIndex] === "(") cls = "f";
+    out += cls ? `<span class="tk-${cls}">${esc(t)}</span>` : esc(t);
+    last = re.lastIndex;
+  }
+  return out + esc(src.slice(last));
+}
+
+/* Markdown: the common subset (headings, lists, quotes, code, emphasis,
+   links, images, rules). Text is escaped before any markup is added, and
+   only http(s), mailto and relative URLs are kept. */
+
+/** Renders Markdown to safe HTML; relative links resolve against dir. */
+function renderMarkdown(src, dir) {
+  const out = [];
+  let para = [], list = null, quote = [], code = null;
+  const flushPara = () => { if (para.length) out.push(`<p>${mdInline(para.join(" "), dir)}</p>`); para = []; };
+  const flushList = () => { if (list) out.push(`<${list.tag}>${list.items.map((t) => `<li>${mdInline(t, dir)}</li>`).join("")}</${list.tag}>`); list = null; };
+  const flushQuote = () => { if (quote.length) out.push(`<blockquote>${renderMarkdown(quote.join("\n"), dir)}</blockquote>`); quote = []; };
+  const flush = () => { flushPara(); flushList(); flushQuote(); };
+  // One line at a time; fenced code swallows everything until its fence.
+  for (const line of src.replace(/\r\n?/g, "\n").split("\n")) {
+    if (code) {
+      if (/^\s*(```|~~~)/.test(line)) { out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`); code = null; }
+      else code.push(line);
+      continue;
+    }
+    let m;
+    if (/^\s*(```|~~~)/.test(line)) { flush(); code = []; }
+    else if ((m = line.match(/^(#{1,6})\s+(.*?)\s*#*\s*$/))) { flush(); out.push(`<h${m[1].length}>${mdInline(m[2], dir)}</h${m[1].length}>`); }
+    else if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { flush(); out.push("<hr>"); }
+    else if ((m = line.match(/^>\s?(.*)$/))) { flushPara(); flushList(); quote.push(m[1]); }
+    else if ((m = line.match(/^\s*([-*+]|\d+[.)])\s+(.*)$/))) {
+      flushPara(); flushQuote();
+      const tag = /\d/.test(m[1]) ? "ol" : "ul";
+      if (!list || list.tag !== tag) { flushList(); list = { tag, items: [] }; }
+      list.items.push(m[2]);
+    } else if (!line.trim()) flush();
+    else if (list && /^\s{2,}/.test(line)) list.items[list.items.length - 1] += " " + line.trim();
+    else { flushList(); flushQuote(); para.push(line.trim()); }
+  }
+  if (code) out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`);
+  flush();
+  return out.join("\n");
+}
+
+/** Inline Markdown: code spans first (their contents stay literal), then
+ *  images, links, bold and italics on the escaped remainder. */
+function mdInline(text, dir) {
+  return text.split(/(`[^`]+`)/).map((part, i) => {
+    if (i % 2) return `<code>${esc(part.slice(1, -1))}</code>`;
+    return esc(part)
+      .replace(/!\[([^\]]*)\]\(([^)\s]+)[^)]*\)/g, (_, alt, u) => {
+        const href = mdURL(u, dir, true);
+        return href ? `<img src="${href}" alt="${alt}">` : alt;
+      })
+      .replace(/\[([^\]]+)\]\(([^)\s]+)[^)]*\)/g, (_, t, u) => {
+        const href = mdURL(u, dir, false);
+        return href ? `<a href="${href}" target="_blank" rel="noopener">${t}</a>` : t;
+      })
+      .replace(/\*\*([^*]+)\*\*|__([^_]+)__/g, (_, a, b) => `<strong>${a ?? b}</strong>`)
+      .replace(/(^|[^\w*])\*([^*\s][^*]*)\*|(^|\W)_([^_\s][^_]*)_(?=\W|$)/g, (_, p1, a, p2, b) => `${p1 ?? p2}<em>${a ?? b}</em>`);
+  }).join("");
+}
+
+/** Makes a Markdown URL safe: http(s)/mailto stay, anchors stay, relative
+ *  paths point at the file in this server. Anything else is dropped. The
+ *  input is already HTML-escaped, which is also what an attribute needs. */
+function mdURL(u, dir, inline) {
+  const raw = u.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+  if (/^(https?:|mailto:)/i.test(raw) || raw.startsWith("#")) return u;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(raw) || raw.startsWith("//")) return "";
+  // Resolve ./ and ../ against the Markdown file's folder.
+  const parts = (raw.startsWith("/") ? [] : dir.split("/")).filter(Boolean);
+  for (const seg of raw.split(/[?#]/)[0].split("/")) {
+    if (seg === "..") parts.pop(); else if (seg && seg !== ".") parts.push(seg);
+  }
+  return esc("/f" + encPath("/" + parts.map((p) => { try { return decodeURIComponent(p); } catch { return p; } }).join("/")) + (inline ? "?inline=1" : ""));
+}
+
+/* ------------------------------------------------------------------ */
+/* share links                                                        */
+/* ------------------------------------------------------------------ */
+
+/** Shows the share dialog for an entry at path. */
+function openShareDialog(e, path) {
+  const box = $("#dialog-box");
+  box.innerHTML = `
+    <h2>${icon("i-share")}Share ${e.dir ? "folder" : "file"}</h2>
+    <p class="dlg-sub">Anyone with the link can download <b>${esc(e.name)}</b>${e.dir ? " and what's inside" : ""}. No token needed; nothing else is visible.</p>
+    <label class="dlg-row">Link expires
+      <select id="sh-ttl"><option value="900">in 15 minutes</option><option value="3600" selected>in 1 hour</option>
+      <option value="86400">in 1 day</option><option value="604800">in 7 days</option><option value="0">never (while the server runs)</option></select></label>
+    <label class="dlg-row">Downloads allowed
+      <select id="sh-uses"><option value="1">1</option><option value="3" selected>3</option><option value="10">10</option><option value="0">unlimited</option></select></label>
+    <div class="dlg-actions"><button class="btn secondary" id="sh-cancel">Cancel</button><button class="btn primary" id="sh-create">${icon("i-link")}<span>Create link</span></button></div>`;
+  $("#dialog").hidden = false;
+  $("#sh-ttl").focus();
+  $("#sh-cancel").onclick = closeDialog;
+  $("#sh-create").onclick = async () => {
+    try {
+      const r = await api("/api/shares", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path, ttl: +$("#sh-ttl").value, uses: +$("#sh-uses").value }),
+      });
+      // Prefer the address this page uses, unless it is this machine's own
+      // loopback, which nobody else can open.
+      const url = /^(localhost|127\.|\[::1\])/.test(location.hostname) && r.url.startsWith("http") ? r.url : location.origin + "/s/" + r.id;
+      box.innerHTML = `
+        <h2>${icon("i-check")}Link ready</h2>
+        <p class="dlg-sub">${esc(e.name)} · ${r.expires ? "expires " + fmtDate(r.expires) : "no expiry"} · ${r.maxUses ? r.maxUses + " download" + (r.maxUses > 1 ? "s" : "") : "unlimited downloads"}</p>
+        <div class="dlg-link"><input id="sh-url" readonly value="${esc(url)}"><button class="btn primary" id="sh-copy">Copy</button></div>
+        <p class="dlg-note">The host can revoke it at any time from the ${esc(state.info.name || "Pidgeon")} dashboard.</p>
+        <div class="dlg-actions"><button class="btn secondary" id="sh-done">Done</button></div>`;
+      $("#sh-url").select();
+      $("#sh-copy").onclick = () => copyText(url, "share link");
+      $("#sh-done").onclick = closeDialog;
+    } catch (err) {
+      note("Couldn't create the link: " + err.message, "err");
+    }
+  };
+}
+
+/** Closes the dialog. */
+function closeDialog() {
+  $("#dialog").hidden = true;
+  $("#dialog-box").innerHTML = "";
+  if (!touch) $("#list").focus({ preventScroll: true });
+}
+
+/* ------------------------------------------------------------------ */
+/* files from the host and to the host                                */
+/* ------------------------------------------------------------------ */
+
+/** Shows a file the host sent from the dashboard, with a download button.
+ *  It stays until dismissed (or for two minutes). */
+function showSendNote(m) {
+  const e = { name: m.name, size: m.size, mtime: m.mtime, path: m.path };
+  const el = document.createElement("div");
+  el.className = "note send";
+  el.innerHTML = `${icon("i-mail")}<span><b>${esc(m.name)}</b> arrived from the host · ${fmtBytes(m.size)}</span>
+    ${previewKind(e) ? `<button class="btn secondary" data-a="view">Preview</button>` : ""}
+    <button class="btn primary" data-a="get">Download</button><button class="icon-btn" data-a="x" aria-label="Dismiss">${icon("i-x")}</button>`;
+  el.addEventListener("click", (ev) => {
+    const a = ev.target.closest("[data-a]")?.dataset.a;
+    if (a === "get") startDownload({ name: e.name, url: "/f" + encPath(e.path), kind: "file", total: e.size, entry: e });
+    if (a === "view") openPreview(e);
+    if (a) el.remove();
+  });
+  $("#notes").append(el);
+  setTimeout(() => el.remove(), 120_000);
+  // Flash the tab title when the page isn't in front.
+  if (document.hidden) {
+    const t = document.title;
+    document.title = "📨 " + m.name;
+    addEventListener("focus", () => { document.title = t; }, { once: true });
+  }
+}
+
+/** Opens the file picker for uploads. */
+function pickUploads() {
+  if (!state.info.inbox) return note("Uploads are off on this server", "err");
+  $("#up-input").click();
+}
+
+const uploadQueue = [];
+let uploading = 0;
+const UPLOAD_PARALLEL = 2;
+
+/** Queues files to send into the host's inbox. */
+function uploadFiles(files) {
+  if (!files.length) return;
+  const max = state.info.inboxMax || 0;
+  // Each file gets a row in the transfers panel right away.
+  for (const f of files) {
+    const id = `up.${++state.seq}`;
+    const d = { id, name: f.name, kind: "upload", total: f.size, sent: 0, rate: 0, state: "queued", added: Date.now(), lastProgress: Date.now(), entry: { name: f.name } };
+    state.downloads.set(id, d);
+    if (max && f.size > max) { d.state = "failed"; d.error = `larger than the ${fmtBytes(max)} limit`; continue; }
+    uploadQueue.push([d, f]);
+  }
+  togglePanel(true);
+  renderDownloads();
+  pumpUploads();
+}
+
+/** Starts queued uploads, a couple at a time. */
+function pumpUploads() {
+  while (uploading < UPLOAD_PARALLEL && uploadQueue.length) {
+    const [d, f] = uploadQueue.shift();
+    uploading++;
+    sendUpload(d, f).finally(() => { uploading--; pumpUploads(); });
+  }
+}
+
+/** Sends one file with XMLHttpRequest (fetch can't report upload progress). */
+function sendUpload(d, f) {
+  return new Promise((resolve) => {
+    const xhr = new XMLHttpRequest();
+    let lastAt = Date.now(), lastSent = 0;
+    xhr.open("PUT", "/api/upload?name=" + encodeURIComponent(f.name));
+    xhr.upload.onprogress = (ev) => {
+      const now = Date.now();
+      // Smooth the rate over the last moments, like the server does.
+      if (now - lastAt >= 400) {
+        const inst = ((ev.loaded - lastSent) * 1000) / (now - lastAt);
+        d.rate = d.rate ? d.rate * 0.6 + inst * 0.4 : inst;
+        lastAt = now; lastSent = ev.loaded;
+      }
+      if (ev.loaded > d.sent) d.lastProgress = now;
+      d.sent = ev.loaded;
+      d.state = "active";
+      renderDownloads();
+    };
+    xhr.onload = () => {
+      let msg = xhr.responseText.trim();
+      if (xhr.status === 200) {
+        try { const r = JSON.parse(msg); d.savedAs = r.name; } catch {}
+        d.state = "done";
+        d.sent = d.total;
+        note(`Sent ${d.name}`, "ok");
+      } else {
+        d.state = "failed";
+        d.error = xhr.status === 401 ? "not signed in" : msg || "upload failed";
+      }
+      d.rate = 0;
+      renderDownloads();
+      resolve();
+    };
+    xhr.onerror = xhr.onabort = () => { d.state = "failed"; d.error = "connection lost"; d.rate = 0; renderDownloads(); resolve(); };
+    d.state = "active";
+    renderDownloads();
+    xhr.send(f);
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* misc                                                               */
 /* ------------------------------------------------------------------ */
+
+/** Flips "always store" for ZIPs (bigger, but exact size and resumable). */
+function toggleZipStore() {
+  state.zipStore = !state.zipStore;
+  saveJSON("zipStore", state.zipStore);
+  note(state.zipStore ? "ZIPs are now stored uncompressed: exact size and resumable" : "ZIPs are compressed again (only all-compressed selections are resumable)");
+}
+
+/** Shows when the server will stop by itself (--expire, --once, --max-bytes). */
+function renderLimits() {
+  const i = state.info, el = $("#sb-limit");
+  const parts = [];
+  if (i.expires) {
+    const left = (i.expires - Date.now()) / 1000;
+    parts.push(left > 0 ? `closes in ${fmtDur(left < 120 ? left : Math.ceil(left / 60) * 60)}` : "closing");
+  }
+  if (i.once) parts.push("closes after one download");
+  if (i.maxBytes) parts.push(`${fmtBytes(i.maxBytes)} data limit`);
+  el.hidden = !parts.length;
+  el.textContent = parts.length ? "⏱ " + parts.join(" · ") : "";
+  el.classList.toggle("warn", !!i.expires && i.expires - Date.now() < 60_000);
+}
 
 /** Changes the sort column (toggling direction if it is already active). */
 function setSort(key) {
@@ -1280,7 +1859,11 @@ function wire() {
     const i = +row.dataset.i, e = state.view[i];
     if (ev.target.closest(".act-dl")) { e.dir ? downloadZip([e.name]) : downloadFile(e); return; }
     if (ev.target.closest(".act-link")) { copyText(entryURL(e), "link"); return; }
-    if (ev.target.closest(".act-preview")) return; // native link
+    // The eye opens the in-app preview; with a modifier it stays a normal link.
+    if (ev.target.closest(".act-preview")) {
+      if (!(ev.metaKey || ev.ctrlKey || ev.shiftKey)) { ev.preventDefault(); openPreview(e); }
+      return;
+    }
     setCursor(i);
     if (ev.metaKey || ev.ctrlKey) { setSelected(i, !state.sel.has(e.name)); state.anchor = i; selectionChanged(); return; }
     if (ev.shiftKey) { selectRange(state.anchor, i); selectionChanged(); return; }
@@ -1336,6 +1919,8 @@ function wire() {
       case " ": {
         ev.preventDefault();
         const e = state.view[state.cursor];
+        // Shift+Space previews the cursor row, like Quick Look.
+        if (ev.shiftKey) { if (previewKind(e)) openPreview(e); break; }
         setSelected(state.cursor, !state.sel.has(e.name));
         state.anchor = state.cursor;
         selectionChanged();
@@ -1413,7 +1998,7 @@ function wire() {
 
   $("#cc").addEventListener("click", () => openPalette());
   $("#palette").addEventListener("mousedown", (ev) => { if (ev.target.id === "palette") closePalette(); });
-  $("#pal-input").addEventListener("input", renderPalette);
+  $("#pal-input").addEventListener("input", () => renderPalette());
   $("#pal-input").addEventListener("keydown", (ev) => {
     if (ev.key === "ArrowDown") { ev.preventDefault(); palMove(1); }
     else if (ev.key === "ArrowUp") { ev.preventDefault(); palMove(-1); }
@@ -1432,6 +2017,14 @@ function wire() {
   addEventListener("keydown", (ev) => {
     const mod = ev.metaKey || ev.ctrlKey;
     const k = ev.key.toLowerCase();
+    // An open preview or dialog owns the keyboard.
+    if (!$("#dialog").hidden) { if (ev.key === "Escape") { ev.preventDefault(); closeDialog(); } return; }
+    if (!$("#preview").hidden) {
+      if (ev.key === "Escape") { ev.preventDefault(); closePreview(); }
+      else if (ev.key === "ArrowLeft" && !ev.target.closest("video, audio")) { ev.preventDefault(); stepPreview(-1); }
+      else if (ev.key === "ArrowRight" && !ev.target.closest("video, audio")) { ev.preventDefault(); stepPreview(1); }
+      return;
+    }
     if (mod && k === "p") { ev.preventDefault(); openPalette(ev.shiftKey ? ">" : ""); }
     else if (ev.key === "F1") { ev.preventDefault(); openPalette(">"); }
     else if (mod && k === "b" && !ev.shiftKey) { ev.preventDefault(); toggleSidebar(); }
@@ -1440,6 +2033,42 @@ function wire() {
   });
 
   makeSash($("#sash"), "--sidebar-w", { axis: "x", min: 170, max: 520 });
+
+  // Preview controls.
+  $("#pv-close").addEventListener("click", closePreview);
+  $("#pv-prev").addEventListener("click", () => stepPreview(-1));
+  $("#pv-next").addEventListener("click", () => stepPreview(1));
+  $("#pv-dl").addEventListener("click", () => { const e = pv.list[pv.i]; if (e) startDownload({ name: e.name, url: "/f" + encPath(e.path), kind: "file", total: e.size, entry: e }); });
+  $("#preview").addEventListener("mousedown", (ev) => { if (ev.target.id === "preview") closePreview(); });
+  // Swipe between files on touch screens.
+  let swipeX = null;
+  $("#pv-body").addEventListener("touchstart", (ev) => { swipeX = ev.touches.length === 1 ? ev.touches[0].clientX : null; }, { passive: true });
+  $("#pv-body").addEventListener("touchend", (ev) => {
+    if (swipeX == null) return;
+    const dx = ev.changedTouches[0].clientX - swipeX;
+    swipeX = null;
+    if (Math.abs(dx) > 60 && pv.kind === "image") stepPreview(dx < 0 ? 1 : -1);
+  });
+  $("#dialog").addEventListener("mousedown", (ev) => { if (ev.target.id === "dialog") closeDialog(); });
+
+  // Uploads: the button, the file picker, and drag and drop anywhere.
+  $("#up-btn").addEventListener("click", pickUploads);
+  $("#up-input").addEventListener("change", (ev) => { uploadFiles([...ev.target.files]); ev.target.value = ""; });
+  let dragDepth = 0;
+  const hasFiles = (ev) => state.info.inbox && [...(ev.dataTransfer?.types || [])].includes("Files");
+  addEventListener("dragenter", (ev) => { if (!hasFiles(ev)) return; ev.preventDefault(); dragDepth++; $("#drop").hidden = false; });
+  addEventListener("dragover", (ev) => { if (hasFiles(ev)) ev.preventDefault(); });
+  addEventListener("dragleave", () => { if (dragDepth && --dragDepth === 0) $("#drop").hidden = true; });
+  addEventListener("drop", (ev) => {
+    if (!hasFiles(ev)) return;
+    ev.preventDefault();
+    dragDepth = 0;
+    $("#drop").hidden = true;
+    uploadFiles([...ev.dataTransfer.files]);
+  });
+
+  // The session-limit countdown in the status bar.
+  setInterval(renderLimits, 1000);
 
   // Keep "starting…" labels fresh even without server events.
   setInterval(() => { if ([...state.downloads.values()].some((d) => d.state === "queued")) renderDownloads(); }, 1000);
@@ -1454,12 +2083,19 @@ async function main() {
   setLayout(state.layout);
   wire();
   renderDownloads();
+  ensureEvents();
   load(pathFromHash());
   try {
     state.info = await api("/api/info");
     $("#sb-auth").textContent = { token: "🔒 token", basic: "🔒 basic auth", open: "no auth" }[state.info.auth] || "";
     renderCrumbs();
     renderTree();
+    // Uploads are offered only when the host turned the inbox on.
+    $("#up-btn").hidden = !state.info.inbox;
+    $("#dl-empty").textContent = state.info.inbox
+      ? "Nothing yet. Click a file to download it, or drop files anywhere to send them to this computer."
+      : $("#dl-empty").textContent;
+    renderLimits();
   } catch {}
 }
 

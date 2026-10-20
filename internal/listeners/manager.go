@@ -48,6 +48,51 @@ func (i Info) URL() string {
 	return "http://" + i.Host() + ":" + strconv.Itoa(i.Port) + "/"
 }
 
+// ReachableURL picks the address other devices are most likely to reach,
+// as "http://host:port" without a trailing slash: the primary LAN address,
+// then any LAN, VPN or other address, and loopback only as a last resort.
+// With the wildcard bound every address is reachable through it. It
+// returns "" when nothing is serving.
+func ReachableURL(infos []Info) string {
+	wildPort := 0
+	for _, l := range infos {
+		if l.ID == WildcardID && l.Bound {
+			wildPort = l.Port
+		}
+	}
+	rank := func(l Info) int {
+		switch {
+		case l.Kind == KindLAN && l.Primary:
+			return 5
+		case l.Kind == KindLAN:
+			return 4
+		case l.Kind == KindVPN:
+			return 3
+		case l.Kind == KindLoopback:
+			return 1
+		}
+		return 2
+	}
+	best, pick := 0, Info{}
+	// Keep the best-ranked address that can actually be reached.
+	for _, l := range infos {
+		if l.ID == WildcardID || !(l.Serving() || wildPort > 0) {
+			continue
+		}
+		if r := rank(l); r > best {
+			best, pick = r, l
+		}
+	}
+	if best == 0 {
+		return ""
+	}
+	port := pick.Port
+	if !pick.Bound && wildPort > 0 {
+		port = wildPort
+	}
+	return "http://" + pick.Host() + ":" + strconv.Itoa(port)
+}
+
 // listener is the mutable per-address state. All fields are guarded by
 // Manager.mu.
 type listener struct {

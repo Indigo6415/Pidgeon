@@ -4,6 +4,8 @@ package humanize
 import (
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -65,4 +67,24 @@ func ETA(sent, total int64, bps float64) string {
 		return ""
 	}
 	return Duration(time.Duration(float64(total-sent) / bps * float64(time.Second)))
+}
+
+// ParseBytes reads a size such as "500", "750K", "1.5G" or "2 GB" (1024-based,
+// case-insensitive, an optional trailing "B" or "iB") into bytes.
+func ParseBytes(s string) (int64, error) {
+	t := strings.ToUpper(strings.TrimSpace(s))
+	t = strings.TrimSuffix(strings.TrimSuffix(t, "IB"), "B")
+	mult := 1.0
+	// A unit letter, if any, is the last character left.
+	if n := len(t); n > 0 {
+		if i := strings.IndexByte("KMGTP", t[n-1]); i >= 0 {
+			mult = math.Pow(1024, float64(i+1))
+			t = t[:n-1]
+		}
+	}
+	v, err := strconv.ParseFloat(strings.TrimSpace(t), 64)
+	if err != nil || v < 0 || math.IsInf(v*mult, 0) {
+		return 0, fmt.Errorf("%q is not a size (try 500M or 2G)", s)
+	}
+	return int64(v * mult), nil
 }

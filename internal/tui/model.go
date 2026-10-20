@@ -6,13 +6,17 @@ import (
 	"context"
 	"errors"
 	"image/color"
+	"strings"
 	"time"
 
 	"charm.land/bubbles/v2/help"
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/Indigo6415/pidgeon/internal/brand"
+	"github.com/Indigo6415/pidgeon/internal/devices"
+	"github.com/Indigo6415/pidgeon/internal/humanize"
 	"github.com/Indigo6415/pidgeon/internal/listeners"
+	"github.com/Indigo6415/pidgeon/internal/server"
 	"github.com/Indigo6415/pidgeon/internal/stats"
 )
 
@@ -29,6 +33,35 @@ type Options struct {
 	AuthMode string // "open", "token", "basic", "token + basic"
 	Splash   bool   // play the startup splash
 	URLs     []string
+
+	Server  *server.Server    // share links, sending files, the file picker; optional
+	Devices *devices.Registry // the Devices panel and --ask approvals; optional
+	Limits  Limits            // shown as a countdown / budget in the header
+}
+
+// Limits are the conditions under which the session ends by itself.
+type Limits struct {
+	Deadline time.Time // --expire: stop at this time (zero = never)
+	Once     bool      // --once: stop after the first completed download
+	MaxBytes int64     // --max-bytes: stop once this much has been served (0 = no limit)
+}
+
+// Active reports whether any limit is set.
+func (l Limits) Active() bool { return !l.Deadline.IsZero() || l.Once || l.MaxBytes > 0 }
+
+// Describe says when the session ends, e.g. "in 30m or after 5.00 GB".
+func (l Limits) Describe() string {
+	var parts []string
+	if !l.Deadline.IsZero() {
+		parts = append(parts, "in "+humanize.Duration(time.Until(l.Deadline)))
+	}
+	if l.Once {
+		parts = append(parts, "after the first download")
+	}
+	if l.MaxBytes > 0 {
+		parts = append(parts, "after "+humanize.Bytes(l.MaxBytes)+" served")
+	}
+	return strings.Join(parts, " or ")
 }
 
 // Run starts the dashboard and blocks until the user quits or Ctx ends.

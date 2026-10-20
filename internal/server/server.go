@@ -67,7 +67,7 @@ type Server struct {
 	shares  map[string]*share
 
 	inbox     *os.Root // upload target; nil when uploads are off
-	inboxRel  string   // inbox as a root-relative folder when it is inside the served dir
+	inboxRel  string   // inbox as a root-relative folder ("." or "a/b") when it is browsable, else ""
 	uploadMu  sync.Mutex
 	uploading map[string]bool // inbox names reserved by uploads in progress
 

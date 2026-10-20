@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -16,8 +17,10 @@ import (
 	"charm.land/lipgloss/v2"
 
 	"github.com/Indigo6415/pidgeon/internal/brand"
+	"github.com/Indigo6415/pidgeon/internal/devices"
 	"github.com/Indigo6415/pidgeon/internal/humanize"
 	"github.com/Indigo6415/pidgeon/internal/listeners"
+	"github.com/Indigo6415/pidgeon/internal/server"
 	"github.com/Indigo6415/pidgeon/internal/stats"
 )
 
@@ -26,8 +29,13 @@ type focus int
 
 const (
 	focusListeners focus = iota
+	focusDevices
+	focusShares
 	focusTransfers
 )
+
+// sections is the order the cursor walks through the panels.
+var sections = []focus{focusListeners, focusDevices, focusShares, focusTransfers}
 
 // spinner frames for transfers whose size isn't known (ZIP streams).
 var spinner = []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
@@ -42,19 +50,28 @@ type dashboard struct {
 	focus focus
 
 	lcur int    // listener cursor
+	dsel string // selected device IP
+	ssel string // selected share link ID
 	tsel uint64 // selected transfer ID (stable while the list reshuffles)
 
-	snap  stats.Snapshot
-	lis   []listeners.Info
-	frame int
+	snap    stats.Snapshot
+	lis     []listeners.Info
+	devs    []devices.Device
+	prompts []devices.Prompt
+	online  map[string]int // open web UI tabs per device IP
+	shares  []server.Share
+	frame   int
+
+	deferred map[uint64]bool // prompts the operator put off ("decide later")
 
 	flash      string
 	flashErr   bool
 	flashUntil time.Time
 	quitArmed  time.Time
 
-	qr   qrBlock
-	qrOK bool
+	qr     qrBlock
+	qrOK   bool
+	qrNote string // what the QR code points at
 
 	menu *menu // open popup menu, if any; it captures all keys
 }
@@ -63,7 +80,7 @@ type dashboard struct {
 func newDashboard(o Options) *dashboard {
 	h := help.New()
 	h.Styles = help.DefaultStyles(true)
-	d := &dashboard{o: o, th: newTheme(true, hex("#000000")), keys: defaultKeys(), help: h}
+	d := &dashboard{o: o, th: newTheme(true, hex("#000000")), keys: defaultKeys(), help: h, deferred: map[uint64]bool{}}
 	d.refresh()
 	return d
 }
@@ -72,15 +89,27 @@ func newDashboard(o Options) *dashboard {
 func (d *dashboard) refresh() {
 	d.snap = d.o.Store.Snapshot()
 	d.lis = d.o.Manager.List()
+	if d.o.Devices != nil {
+		d.devs = d.o.Devices.List()
+		d.prompts = d.o.Devices.Prompts()
+	}
+	if d.o.Server != nil {
+		d.online = d.o.Server.Online()
+		d.shares = d.o.Server.Shares()
+	}
 	d.frame++
 	d.lcur = min(max(0, d.lcur), max(0, len(d.lis)-1))
-	// Transfers expire after a minute; don't leave focus on an empty panel.
-	if d.focus == focusTransfers && len(d.snap.Transfers) == 0 {
+	// Rows come and go (transfers expire, devices are forgotten); don't
+	// leave focus on an empty panel.
+	if d.count(d.focus) == 0 {
 		d.focus = focusListeners
 	}
+	d.syncPrompt()
 
 	// Re-encode the QR code only when its target URL changes.
-	if u := d.shareURL(); u != d.qr.text {
+	u, note := d.qrTarget()
+	d.qrNote = note
+	if u != d.qr.text {
 		d.qr, d.qrOK = renderQR(u)
 		d.qr.text = u
 	}
@@ -139,7 +168,7 @@ func (d *dashboard) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		d.move(1)
 
 	case key.Matches(msg, k.Enter):
-		// Listeners toggle directly; transfers open their actions.
+		// Listeners toggle directly; every other row opens its actions.
 		if d.focus == focusListeners {
 			return d.toggleSelected()
 		}
@@ -149,16 +178,17 @@ func (d *dashboard) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		d.menu = d.rowMenu()
 
 	case key.Matches(msg, k.Toggle):
+		if d.focus != focusListeners {
+			d.menu = d.rowMenu()
+			return nil
+		}
 		return d.toggleSelected()
 
 	case key.Matches(msg, k.Focus):
-		// Only move to transfers when there is something to select.
-		if d.focus == focusListeners && len(d.snap.Transfers) > 0 {
-			d.focus = focusTransfers
-			d.ensureTransferSelected()
-		} else {
-			d.focus = focusListeners
-		}
+		d.nextSection()
+
+	case key.Matches(msg, k.Share):
+		return d.startShare()
 
 	case key.Matches(msg, k.Cancel):
 		if d.focus != focusTransfers {
@@ -196,7 +226,16 @@ func (d *dashboard) menuKey(msg tea.KeyPressMsg) tea.Cmd {
 		d.menu.move(-1)
 	case key.Matches(msg, k.Down):
 		d.menu.move(1)
+	case key.Matches(msg, k.Back) && d.menu.back != nil:
+		// The file picker goes up a folder instead of closing.
+		m := d.menu
+		d.menu = nil
+		return m.back()
 	case key.Matches(msg, k.Menu), key.Matches(msg, k.Back), msg.String() == "q":
+		// Closing an approval prompt puts it off rather than answering it.
+		if d.menu.prompt != 0 {
+			d.deferred[d.menu.prompt] = true
+		}
 		d.menu = nil
 	case key.Matches(msg, k.Enter), key.Matches(msg, k.Actions), msg.String() == "space":
 		it, ok := d.menu.selected()
@@ -204,6 +243,14 @@ func (d *dashboard) menuKey(msg tea.KeyPressMsg) tea.Cmd {
 		// Run the action after closing, so it may open another menu.
 		if ok && it.run != nil {
 			return it.run()
+		}
+	default:
+		// One-key answers ("y", "n", ...) on menus that offer them.
+		if it, ok := d.menu.shortcut(msg.String()); ok {
+			d.menu = nil
+			if it.run != nil {
+				return it.run()
+			}
 		}
 	}
 	return nil
@@ -220,16 +267,42 @@ func (d *dashboard) mainMenu() *menu {
 	if d.help.ShowAll {
 		helpLabel = "Hide all keys"
 	}
-	return newMenu(brand.Name,
-		menuItem{label: "Back to dashboard", run: func() tea.Cmd { return nil }},
-		menuItem{label: helpLabel, run: func() tea.Cmd { d.help.ShowAll = !d.help.ShowAll; return nil }},
-		quit,
-	)
+	items := []menuItem{
+		{label: "Back to dashboard", run: func() tea.Cmd { return nil }},
+		{label: helpLabel, run: func() tea.Cmd { d.help.ShowAll = !d.help.ShowAll; return nil }},
+	}
+	// Put-off approvals are one step away.
+	if n := len(d.prompts); n > 0 {
+		items = append(items, menuItem{label: fmt.Sprintf("Review %d waiting request(s)", n), run: func() tea.Cmd {
+			clear(d.deferred)
+			d.syncPrompt()
+			return nil
+		}})
+	}
+	if d.o.Server != nil {
+		items = append(items,
+			menuItem{label: "Create a share link…", hint: "one file or folder, no token needed", run: d.startShare},
+			menuItem{label: "Send a file to a device…", hint: "pops up in its browser", run: d.startSend},
+		)
+	}
+	return newMenu(brand.Name, append(items, quit)...)
 }
 
-// rowMenu lists the actions for the selected listener or transfer.
+// rowMenu lists the actions for the selected row of the focused panel.
 func (d *dashboard) rowMenu() *menu {
 	back := menuItem{label: "Back", run: func() tea.Cmd { return nil }}
+	switch d.focus {
+	case focusDevices:
+		if i := d.devIndex(); i >= 0 {
+			return d.deviceMenu(d.devs[i])
+		}
+		return nil
+	case focusShares:
+		if i := d.shareIndex(); i >= 0 {
+			return d.shareMenu(d.shares[i])
+		}
+		return nil
+	}
 	// Transfer row: the only action is cancelling it.
 	if d.focus == focusTransfers {
 		i := d.selectedIndex()
@@ -237,7 +310,11 @@ func (d *dashboard) rowMenu() *menu {
 			return nil
 		}
 		t := d.snap.Transfers[i]
-		cancel := menuItem{label: "Cancel transfer", hint: "the download fails on " + t.Client, danger: true, run: d.cancelSelected}
+		hint := "the download fails on " + t.Client
+		if t.Kind == stats.KindUpload {
+			hint = "the upload from " + t.Client + " is discarded"
+		}
+		cancel := menuItem{label: "Cancel transfer", hint: hint, danger: true, run: d.cancelSelected}
 		if t.State != stats.StateActive {
 			cancel.disabled, cancel.hint = true, "already finished"
 		}
@@ -295,9 +372,10 @@ func (d *dashboard) cancelSelected() tea.Cmd {
 	return nil
 }
 
-// copyURL puts the share URL on the clipboard (OSC 52).
+// copyURL puts the QR code's URL (the selected listener or share link) on
+// the clipboard (OSC 52).
 func (d *dashboard) copyURL() tea.Cmd {
-	u := d.shareURL()
+	u, _ := d.qrTarget()
 	if u == "" {
 		return nil
 	}
@@ -305,9 +383,9 @@ func (d *dashboard) copyURL() tea.Cmd {
 	return tea.SetClipboard(u)
 }
 
-// openURL opens the share URL in the local browser.
+// openURL opens the QR code's URL in the local browser.
 func (d *dashboard) openURL() tea.Cmd {
-	u := d.shareURL()
+	u, _ := d.qrTarget()
 	if u == "" {
 		return nil
 	}
@@ -315,43 +393,100 @@ func (d *dashboard) openURL() tea.Cmd {
 	return openBrowser(u)
 }
 
-// move shifts the cursor. The two panels form one list: moving down past
-// the last listener enters the transfers, and up past the first transfer
-// returns to the listeners.
+// move shifts the cursor. The panels form one list: moving down past the
+// last row of one panel enters the next panel that has rows, and moving up
+// past the first returns to the previous one.
 func (d *dashboard) move(delta int) {
-	if d.focus == focusListeners {
-		next := d.lcur + delta
-		// Fall through into the transfers panel below.
-		if next >= len(d.lis) && len(d.snap.Transfers) > 0 {
-			d.focus = focusTransfers
-			d.tsel = d.snap.Transfers[0].ID
+	i := d.index(d.focus) + delta
+	// Still inside the current panel.
+	if i >= 0 && i < d.count(d.focus) {
+		d.setIndex(d.focus, i)
+		d.refresh()
+		return
+	}
+	pos := slices.Index(sections, d.focus)
+	// Walk to the next panel in that direction that has something in it.
+	for p := pos + delta; p >= 0 && p < len(sections); p += delta {
+		f := sections[p]
+		if n := d.count(f); n > 0 {
+			d.focus = f
+			if delta > 0 {
+				d.setIndex(f, 0)
+			} else {
+				d.setIndex(f, n-1)
+			}
+			d.refresh()
 			return
 		}
-		d.lcur = min(max(0, next), max(0, len(d.lis)-1))
-		d.refresh()
-		return
 	}
-	n := len(d.snap.Transfers)
-	if n == 0 {
-		d.focus = focusListeners
-		return
-	}
-	i := max(0, d.selectedIndex())
-	// Climb back up into the listeners panel.
-	if i+delta < 0 {
-		d.focus = focusListeners
-		d.lcur = max(0, len(d.lis)-1)
-		d.refresh()
-		return
-	}
-	d.tsel = d.snap.Transfers[min(i+delta, n-1)].ID
 }
 
-// ensureTransferSelected selects the first transfer if none is.
-func (d *dashboard) ensureTransferSelected() {
-	if d.selectedIndex() < 0 && len(d.snap.Transfers) > 0 {
-		d.tsel = d.snap.Transfers[0].ID
+// nextSection moves focus to the next panel with rows (wrapping around).
+func (d *dashboard) nextSection() {
+	pos := slices.Index(sections, d.focus)
+	// Try each other panel once, in order.
+	for k := 1; k <= len(sections); k++ {
+		f := sections[(pos+k)%len(sections)]
+		if d.count(f) > 0 {
+			d.focus = f
+			if d.index(f) < 0 {
+				d.setIndex(f, 0)
+			}
+			d.refresh()
+			return
+		}
 	}
+}
+
+// count is the number of rows in a panel.
+func (d *dashboard) count(f focus) int {
+	switch f {
+	case focusListeners:
+		return len(d.lis)
+	case focusDevices:
+		return len(d.devs)
+	case focusShares:
+		return len(d.shares)
+	}
+	return len(d.snap.Transfers)
+}
+
+// index is the selected row of a panel, or -1.
+func (d *dashboard) index(f focus) int {
+	switch f {
+	case focusListeners:
+		return d.lcur
+	case focusDevices:
+		return d.devIndex()
+	case focusShares:
+		return d.shareIndex()
+	}
+	return d.selectedIndex()
+}
+
+// setIndex selects row i of a panel. Rows other than listeners are
+// remembered by identity, so the selection survives the list reshuffling.
+func (d *dashboard) setIndex(f focus, i int) {
+	switch f {
+	case focusListeners:
+		d.lcur = i
+	case focusDevices:
+		d.dsel = d.devs[i].IP
+	case focusShares:
+		d.ssel = d.shares[i].ID
+	default:
+		d.tsel = d.snap.Transfers[i].ID
+	}
+}
+
+// devIndex finds the selected device.
+func (d *dashboard) devIndex() int {
+	return slices.IndexFunc(d.devs, func(x devices.Device) bool { return x.IP == d.dsel })
+}
+
+// shareIndex finds the selected share link.
+func (d *dashboard) shareIndex() int {
+	return slices.IndexFunc(d.shares, func(x server.Share) bool { return x.ID == d.ssel })
 }
 
 // selectedIndex finds the selected transfer in the current snapshot.
@@ -461,9 +596,14 @@ func (d *dashboard) view(w, h int) string {
 		top = lipgloss.JoinHorizontal(lipgloss.Top, left, " ", d.qrPanel(qrW, lipgloss.Height(left)))
 	}
 
+	// Devices and share links sit between the overview and the transfers.
+	sections := []string{d.header(w), top}
+	if mid := d.middleRow(w); mid != "" {
+		sections = append(sections, mid)
+		top = lipgloss.JoinVertical(lipgloss.Left, top, mid)
+	}
 	// Transfers get what they need (capped); the request log takes the rest.
 	remaining := avail - lipgloss.Height(top)
-	sections := []string{d.header(w), top}
 	if remaining >= 3 {
 		tAvail := remaining - 2
 		const logMin = 5
@@ -497,6 +637,29 @@ func (d *dashboard) view(w, h int) string {
 	return out
 }
 
+// middleRow shows the Devices panel (once a device has connected, or always
+// with --ask) and the Share links panel (once there is a link), side by side
+// when the terminal is wide enough.
+func (d *dashboard) middleRow(w int) string {
+	showDev := len(d.devs) > 0 || (d.o.Devices != nil && d.o.Devices.Ask())
+	showShare := len(d.shares) > 0
+	const maxRows = 6
+	switch {
+	case showDev && showShare && w >= 100:
+		rows := min(maxRows, max(1, len(d.devs), len(d.shares)))
+		devW := w * 11 / 20
+		return lipgloss.JoinHorizontal(lipgloss.Top, d.devicesPanel(devW, rows), " ", d.sharesPanel(w-devW-1, rows))
+	case showDev && showShare:
+		return lipgloss.JoinVertical(lipgloss.Left,
+			d.devicesPanel(w, min(maxRows, max(1, len(d.devs)))), d.sharesPanel(w, min(maxRows, len(d.shares))))
+	case showDev:
+		return d.devicesPanel(w, min(maxRows, max(1, len(d.devs))))
+	case showShare:
+		return d.sharesPanel(w, min(maxRows, len(d.shares)))
+	}
+	return ""
+}
+
 // header is the one-line status bar.
 func (d *dashboard) header(w int) string {
 	th := d.th
@@ -510,16 +673,58 @@ func (d *dashboard) header(w int) string {
 	if serving == 0 {
 		status = fgs(th.err).Render("● stopped")
 	}
+	// Requests waiting for approval are the most urgent thing on screen.
+	if n := len(d.prompts); n > 0 {
+		status += "  " + fgs(th.warn).Bold(true).Render(fmt.Sprintf("⚑ %d waiting", n))
+	}
 	leftPart := fgs(th.accent).Bold(true).Render("⬡ "+strings.ToUpper(brand.Name)) +
 		fgs(th.muted).Render(" "+brand.ResolvedVersion()) + "  " + status + "  " +
 		fgs(th.fg).Render(tildePath(d.o.Dir))
-	right := fgs(th.muted).Render(fmt.Sprintf("up %s · auth: %s ", humanize.Duration(d.snap.Uptime), d.o.AuthMode))
+	auth := d.o.AuthMode
+	if d.o.Devices != nil && d.o.Devices.Ask() {
+		auth += " + ask"
+	}
+	right := fgs(th.muted).Render(fmt.Sprintf("up %s · auth: %s ", humanize.Duration(d.snap.Uptime), auth))
+	if lim := d.limitsBadge(); lim != "" {
+		right = lim + "  " + right
+	}
 	gap := w - lipgloss.Width(leftPart) - lipgloss.Width(right)
 	// Not enough room for both halves: keep the left (status + path).
 	if gap < 1 {
 		return fit(" "+leftPart, w)
 	}
 	return " " + leftPart + strings.Repeat(" ", max(0, gap-1)) + right
+}
+
+// limitsBadge shows how close the session is to ending by itself: the time
+// left (--expire), the data budget (--max-bytes) and --once.
+func (d *dashboard) limitsBadge() string {
+	th := d.th
+	l := d.o.Limits
+	var parts []string
+	if !l.Deadline.IsZero() {
+		left := max(0, time.Until(l.Deadline))
+		s := fmt.Sprintf("%d:%02d", int(left.Minutes()), int(left.Seconds())%60)
+		if left >= time.Hour {
+			s = fmt.Sprintf("%d:%02d:%02d", int(left.Hours()), int(left.Minutes())%60, int(left.Seconds())%60)
+		}
+		c := th.fg
+		if left < time.Minute {
+			c = th.warn
+		}
+		parts = append(parts, fgs(c).Render("⏱ "+s))
+	}
+	if l.MaxBytes > 0 {
+		c := th.fg
+		if d.snap.BytesServed >= l.MaxBytes*9/10 {
+			c = th.warn
+		}
+		parts = append(parts, fgs(c).Render(humanize.Bytes(d.snap.BytesServed)+" / "+humanize.Bytes(l.MaxBytes)))
+	}
+	if l.Once {
+		parts = append(parts, fgs(th.fg).Render("once"))
+	}
+	return strings.Join(parts, fgs(th.muted).Render(" · "))
 }
 
 // listenersPanel shows every bind address with its state and activity.
@@ -619,6 +824,11 @@ func (d *dashboard) throughputPanel(w, sparkRows int) string {
 	if s.Hottest != "" {
 		hot = m.Render("hottest ") + b.Render(s.Hottest) + m.Render(fmt.Sprintf("  ×%d", s.HottestHits))
 	}
+	// With an inbox, what came in matters as much as what went out.
+	if d.o.Server != nil && d.o.Server.Inbox() != "" {
+		in := m.Render("inbox ") + b.Render(humanize.Bytes(s.BytesRecv)) + m.Render(fmt.Sprintf(" in %d upload(s)", s.Uploads))
+		hot = in + m.Render(" · ") + hot
+	}
 	rows = append(rows, hot)
 	return th.panel("Throughput · last 60s", rows, w, false)
 }
@@ -673,10 +883,7 @@ func (d *dashboard) qrPanel(w, h int) string {
 	rows := append([]string{}, d.qr.lines...)
 	rows = append(rows, "")
 	u := d.qr.text
-	note := "selected listener"
-	if strings.Contains(u, "127.0.0.1") {
-		note = "loopback: this machine only"
-	}
+	note := d.qrNote
 	rows = append(rows, fgs(th.accent).Render(strings.TrimPrefix(u, "http://")))
 	for len(rows) < h-3 {
 		rows = append(rows, "")
@@ -695,6 +902,9 @@ func (d *dashboard) transfersPanel(w, maxRows int) string {
 	if len(ts) == 0 {
 		return th.panel(title, []string{fgs(th.faint).Render("No transfers yet. Open one of the URLs above on another device.")}, w, d.focus == focusTransfers)
 	}
+	if up := countUploads(ts); up > 0 {
+		title += fmt.Sprintf(" · %d upload(s)", up)
+	}
 
 	// Keep the selection in view by scrolling the window.
 	start := 0
@@ -705,7 +915,7 @@ func (d *dashboard) transfersPanel(w, maxRows int) string {
 
 	showBytes := inner >= 90
 	showETA := inner >= 104
-	nameW := inner - 2 - 16 - 18 - 11
+	nameW := inner - 2 - 2 - 16 - 18 - 11
 	if showBytes {
 		nameW -= 21
 	}
@@ -731,7 +941,18 @@ func (d *dashboard) transfersPanel(w, maxRows int) string {
 		if t.Kind == stats.KindZip {
 			name += " (zip)"
 		}
-		row := cur + base.Render(padRight(t.Client, 16)) + base.Render(fit(name, nameW)) + " " +
+		if t.Share != "" {
+			name += " (link)"
+		}
+		// ↑ leaves this machine, ↓ arrives in the inbox.
+		dir := fgs(th.accent).Render("↑ ")
+		if t.Kind == stats.KindUpload {
+			dir = fgs(th.accent2).Render("↓ ")
+		}
+		if finished {
+			dir = fgs(th.faint).Render(map[bool]string{true: "↓ ", false: "↑ "}[t.Kind == stats.KindUpload])
+		}
+		row := cur + dir + base.Render(padRight(t.Client, 16)) + base.Render(fit(name, nameW)) + " " +
 			d.progressCell(t, 17) + " " + base.Render(padRight(rateCell(t), 10))
 		if showBytes {
 			row += " " + base.Render(padRight(bytesCell(t), 20))
@@ -742,6 +963,17 @@ func (d *dashboard) transfersPanel(w, maxRows int) string {
 		rows = append(rows, row)
 	}
 	return th.panel(title, rows, w, d.focus == focusTransfers)
+}
+
+// countUploads counts the active uploads among ts.
+func countUploads(ts []stats.View) int {
+	n := 0
+	for _, t := range ts {
+		if t.Kind == stats.KindUpload && t.State == stats.StateActive {
+			n++
+		}
+	}
+	return n
 }
 
 // progressCell renders a gradient bar + percentage, a live spinner for

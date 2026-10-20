@@ -26,6 +26,12 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 		httpError(w, err)
 		return
 	}
+	s.serveFile(w, r, name, "")
+}
+
+// serveFile streams the root-relative file name. share is the share link
+// it was reached through, if any.
+func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, name, share string) {
 	f, err := s.root.Open(name)
 	if err != nil {
 		httpError(w, err)
@@ -45,6 +51,11 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	// Devices, sockets, FIFOs: never stream these.
 	if !fi.Mode().IsRegular() {
 		http.Error(w, "not a regular file", http.StatusForbidden)
+		return
+	}
+	// --max-bytes reached: no new downloads, only what's already running.
+	if s.overBudget() {
+		http.Error(w, "this server has reached its data limit", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -73,10 +84,17 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 		Name:     "/" + name,
 		Kind:     stats.KindFile,
 		Total:    fi.Size(),
+		Inline:   inline,
+		Share:    share,
 	})
 	cw := stats.NewCountingWriter(w, t)
 	http.ServeContent(cw, r, fi.Name(), fi.ModTime(), f)
 	s.cfg.Store.End(t, fileOutcome(cw, t, fi.Size()))
+}
+
+// overBudget reports whether --max-bytes has been reached.
+func (s *Server) overBudget() bool {
+	return s.cfg.MaxBytes > 0 && s.cfg.Store.BytesServed() >= s.cfg.MaxBytes
 }
 
 // fileOutcome classifies a finished file response for the stats store.

@@ -23,6 +23,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/Indigo6415/pidgeon/internal/brand"
+	"github.com/Indigo6415/pidgeon/internal/devices"
 	"github.com/Indigo6415/pidgeon/internal/humanize"
 	"github.com/Indigo6415/pidgeon/internal/listeners"
 	"github.com/Indigo6415/pidgeon/internal/pull"
@@ -47,7 +48,22 @@ type config struct {
 	noSplash bool
 	headless bool
 	version  bool
+
+	ask      bool          // approve each new device (and upload) in the dashboard
+	inbox    string        // upload directory; "" disables uploads
+	inboxMax string        // largest accepted upload, e.g. "2G"
+	expire   time.Duration // stop after this long; 0 = never
+	once     bool          // stop after the first completed download
+	maxBytes string        // stop once this much has been served, e.g. "5G"
 }
+
+// Reasons the server stops on its own (--expire, --once, --max-bytes); the
+// cause is reported in the shutdown summary.
+var (
+	errExpired = errors.New("time limit reached")
+	errOnce    = errors.New("the download is complete (--once)")
+	errBudget  = errors.New("data limit reached")
+)
 
 // Main runs the program with the given arguments (excluding argv[0]) and
 // returns the process exit code.
@@ -87,6 +103,12 @@ func parseFlags(args []string, stderr io.Writer) (config, int) {
 	fs.BoolVar(&c.noSplash, "no-splash", false, "skip the startup animation")
 	fs.BoolVar(&c.headless, "headless", false, "no dashboard: print URLs and a request log (automatic when not a TTY)")
 	fs.BoolVar(&c.version, "version", false, "print the version and exit")
+	fs.BoolVar(&c.ask, "ask", false, "approve each new device (and each upload) in the dashboard before it gets anything")
+	fs.StringVar(&c.inbox, "inbox", "", "let visitors upload files into this directory (created if missing)")
+	fs.StringVar(&c.inboxMax, "inbox-max", "", "largest upload accepted, e.g. 2G (default: no limit)")
+	fs.DurationVar(&c.expire, "expire", 0, "stop serving after this long, e.g. 30m or 2h")
+	fs.BoolVar(&c.once, "once", false, "stop after the first completed download")
+	fs.StringVar(&c.maxBytes, "max-bytes", "", "stop once this much has been served, e.g. 5G")
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "%s — %s\n\n", brand.Name, brand.Tagline)
 		fmt.Fprintf(stderr, "Usage:\n  %s [flags] [directory]\n  %s pull <url> [target-dir]   (preview)\n\n", brand.Command, brand.Command)
@@ -136,13 +158,35 @@ func serve(cfg config, stdout, stderr io.Writer) error {
 		}
 	}
 
+	// Session limits and the inbox.
+	lim, err := parseLimits(cfg)
+	if err != nil {
+		return err
+	}
+	var inboxMax int64
+	if cfg.inboxMax != "" {
+		if cfg.inbox == "" {
+			return errors.New("--inbox-max needs --inbox")
+		}
+		if inboxMax, err = humanize.ParseBytes(cfg.inboxMax); err != nil {
+			return fmt.Errorf("--inbox-max: %w", err)
+		}
+	}
+
 	// The dashboard needs a terminal on both ends that this process owns;
 	// anything else (pipes, services, containers, `&`) runs headless.
 	foreground := isTTY(os.Stdin) && inForeground(os.Stdin)
 	interactive := !cfg.headless && isTTY(os.Stdout) && foreground
+	// Approvals happen in the dashboard; without one, nobody could get in.
+	if cfg.ask && !interactive {
+		return errors.New("--ask needs the dashboard (an interactive terminal); it can't be used headless")
+	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), shutdownSignals()...)
+	sigCtx, stop := signal.NotifyContext(context.Background(), shutdownSignals()...)
 	defer stop()
+	// The limits watcher can end the session too; its cause is the reason.
+	ctx, finish := context.WithCancelCause(sigCtx)
+	defer finish(nil)
 
 	store := stats.New()
 	// Headless mode prints each request as it completes. This must be set
@@ -157,16 +201,22 @@ func serve(cfg config, stdout, stderr io.Writer) error {
 	}
 	go store.Run(ctx)
 
+	reg := devices.New(cfg.ask, devices.TrustFile(brand.Command))
+	var mgr *listeners.Manager
 	srv, err := server.New(server.Config{
 		Dir: dir, ShowHidden: cfg.hidden, Token: token,
 		BasicUser: user, BasicPass: pass, Store: store, Assets: web.Assets(),
+		Devices: reg, Inbox: cfg.inbox, InboxMax: inboxMax,
+		MaxBytes: lim.MaxBytes, Expires: lim.Deadline, Once: lim.Once,
+		// Share links point at the address other devices can reach.
+		BaseURL: func() string { return listeners.ReachableURL(mgr.List()) },
 	})
 	if err != nil {
 		return err
 	}
 	defer srv.Close()
 
-	mgr := listeners.NewManager(listeners.Discover(), srv, cfg.port, store)
+	mgr = listeners.NewManager(listeners.Discover(), srv, cfg.port, store)
 	ids, err := selectListeners(mgr, cfg.bind)
 	if err != nil {
 		return err
@@ -183,7 +233,9 @@ func serve(cfg config, stdout, stderr io.Writer) error {
 
 	infos := mgr.List()
 	urls := printBanner(stdout, dir, infos, token, authMode(token, user))
+	printExtras(stdout, srv.Inbox(), inboxMax, cfg.ask, lim)
 	reportBindErrors(stderr, infos)
+	go watchLimits(ctx, finish, store, lim)
 
 	// Run the dashboard, or just wait for a signal in headless mode.
 	if interactive {
@@ -191,6 +243,7 @@ func serve(cfg config, stdout, stderr io.Writer) error {
 		err = tui.Run(tui.Options{
 			Ctx: ctx, Store: store, Manager: mgr, Dir: dir, Token: token,
 			AuthMode: authMode(token, user), Splash: splash, URLs: urls,
+			Server: srv, Devices: reg, Limits: lim,
 		})
 	} else {
 		// Ctrl+C only reaches a process that owns the terminal.
@@ -204,6 +257,9 @@ func serve(cfg config, stdout, stderr io.Writer) error {
 
 	// Graceful shutdown: end SSE streams, stop accepting, give in-flight
 	// transfers a short grace period, then close what's left.
+	if cause := context.Cause(ctx); errors.Is(cause, errExpired) || errors.Is(cause, errOnce) || errors.Is(cause, errBudget) {
+		fmt.Fprintf(stdout, "stopping: %v\n", cause)
+	}
 	fmt.Fprintln(stdout, "shutting down…")
 	srv.Close()
 	sctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
@@ -214,7 +270,89 @@ func serve(cfg config, stdout, stderr io.Writer) error {
 	snap := store.Snapshot()
 	fmt.Fprintf(stdout, "served %s in %d requests (%d downloads) over %s\n",
 		humanize.Bytes(snap.BytesServed), snap.Requests, snap.Downloads, humanize.Duration(snap.Uptime))
+	if snap.Uploads > 0 {
+		fmt.Fprintf(stdout, "received %d upload(s), %s, in %s\n", snap.Uploads, humanize.Bytes(snap.BytesRecv), srv.Inbox())
+	}
 	return err
+}
+
+// parseLimits reads --expire, --once and --max-bytes.
+func parseLimits(cfg config) (tui.Limits, error) {
+	var lim tui.Limits
+	if cfg.expire < 0 {
+		return lim, errors.New("--expire must be positive")
+	}
+	if cfg.expire > 0 {
+		lim.Deadline = time.Now().Add(cfg.expire)
+	}
+	lim.Once = cfg.once
+	if cfg.maxBytes != "" {
+		n, err := humanize.ParseBytes(cfg.maxBytes)
+		if err != nil || n <= 0 {
+			return lim, fmt.Errorf("--max-bytes: %q is not a positive size (try 5G)", cfg.maxBytes)
+		}
+		lim.MaxBytes = n
+	}
+	return lim, nil
+}
+
+// watchLimits ends the session (via finish) when a limit is reached:
+// --expire at its deadline; --once after the first completed download, once
+// nothing else is still downloading; --max-bytes once that much has been
+// served (the server refuses new downloads from then on) and the running
+// ones have finished.
+func watchLimits(ctx context.Context, finish context.CancelCauseFunc, st *stats.Store, lim tui.Limits) {
+	if !lim.Active() {
+		return
+	}
+	tk := time.NewTicker(250 * time.Millisecond)
+	defer tk.Stop()
+	// Check a few times a second until a limit trips or the session ends.
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tk.C:
+		}
+		idle := st.ActiveDownloads() == 0
+		switch {
+		case !lim.Deadline.IsZero() && !time.Now().Before(lim.Deadline):
+			finish(errExpired)
+			return
+		case lim.Once && idle && st.Snapshot().Downloads > 0:
+			finish(errOnce)
+			return
+		case lim.MaxBytes > 0 && idle && st.BytesServed() >= lim.MaxBytes:
+			finish(errBudget)
+			return
+		}
+	}
+}
+
+// printExtras lists the optional features in the startup banner.
+func printExtras(w io.Writer, inbox string, inboxMax int64, ask bool, lim tui.Limits) {
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("#8b949e"))
+	bold := lipgloss.NewStyle().Bold(true)
+	printed := false
+	if inbox != "" {
+		note := "  (visitors can upload here"
+		if inboxMax > 0 {
+			note += ", up to " + humanize.Bytes(inboxMax) + " per file"
+		}
+		lipgloss.Fprintln(w, "  inbox: "+bold.Render(inbox)+muted.Render(note+")"))
+		printed = true
+	}
+	if ask {
+		lipgloss.Fprintln(w, "  "+bold.Render("--ask")+muted.Render(": each new device waits until you allow it in the dashboard"))
+		printed = true
+	}
+	if s := lim.Describe(); s != "" {
+		lipgloss.Fprintln(w, "  stops "+bold.Render(s))
+		printed = true
+	}
+	if printed {
+		lipgloss.Fprintln(w)
+	}
 }
 
 // selectListeners turns the --bind value into listener IDs.

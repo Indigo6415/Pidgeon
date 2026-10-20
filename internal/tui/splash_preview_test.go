@@ -6,11 +6,14 @@ import (
 	"net/http"
 	"os"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/Indigo6415/pidgeon/internal/devices"
 	"github.com/Indigo6415/pidgeon/internal/listeners"
+	"github.com/Indigo6415/pidgeon/internal/server"
 	"github.com/Indigo6415/pidgeon/internal/stats"
 )
 
@@ -51,9 +54,25 @@ func TestDashboardPreview(t *testing.T) {
 	for i := range 6 {
 		st.Log(stats.LogEntry{Time: time.Now(), Client: "192.168.1.33", Method: "GET", Path: fmt.Sprintf("/f/file%d.jpg", i), Status: 200 + i%3*102, Bytes: int64(i) << 20})
 	}
-	dash := newDashboard(Options{Store: st, Manager: mgr, Dir: "/Users/someone/Downloads", AuthMode: "open"})
+	// Devices, a share link, an upload and a time limit, so the newer
+	// panels show up too.
+	reg := devices.New(true, "")
+	reg.Allow("192.168.1.33", false)
+	reg.Admit(context.Background(), "192.168.1.33", "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0) Safari/604.1", 0)
+	reg.Allow("192.168.1.40", true)
+	reg.Admit(context.Background(), "192.168.1.40", "Mozilla/5.0 (Macintosh) Chrome/130.0 Safari/537.36", 0)
+	srv, err := server.New(server.Config{Dir: t.TempDir(), Store: st, Devices: reg, Assets: fstest.MapFS{"index.html": {Data: []byte("x")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.CreateShare("/", time.Hour, 3)
+	u := st.Begin(stats.TransferInfo{Client: "192.168.1.33", Name: "/Inbox/IMG_2041.HEIC", Kind: stats.KindUpload, Total: 4 << 20})
+	u.Add(3 << 20)
+	dash := newDashboard(Options{Store: st, Manager: mgr, Dir: "/Users/someone/Downloads", AuthMode: "open",
+		Server: srv, Devices: reg, Limits: Limits{Deadline: time.Now().Add(29 * time.Minute)}})
 	dash.th = newTheme(true, hex("#0d1117"))
-	fmt.Println(dash.view(130, 42))
+	fmt.Println(dash.view(130, 46))
 }
 
 // TestMenuPreview prints the dashboard with the esc menu open.

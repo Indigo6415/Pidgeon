@@ -4,10 +4,12 @@ import "charm.land/bubbles/v2/key"
 
 // keyMap lists every dashboard binding; the footer is generated from it.
 // Everything is reachable with the arrows, enter and esc alone; the letter
-// keys are shortcuts for the same actions.
+// keys are shortcuts for the same actions. Approval prompts also answer to
+// y / a / n while they are open.
 type keyMap struct {
 	Up, Down, Enter, Actions, Back, Menu          key.Binding
 	Toggle, Focus, Cancel, Copy, Open, Help, Quit key.Binding
+	Share                                         key.Binding
 }
 
 // defaultKeys returns the dashboard key bindings.
@@ -25,6 +27,7 @@ func defaultKeys() keyMap {
 		Cancel: key.NewBinding(key.WithKeys("x", "delete"), key.WithHelp("x", "cancel transfer")),
 		Copy:   key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "copy URL")),
 		Open:   key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "open in browser")),
+		Share:  key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "new share link")),
 		Help:   key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "all keys")),
 		Quit:   key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	}
@@ -41,6 +44,7 @@ func (k keyMap) FullHelp() [][]key.Binding {
 		{k.Up, k.Down, k.Enter},
 		{k.Actions, k.Back, k.Menu},
 		{k.Toggle, k.Focus, k.Cancel},
-		{k.Copy, k.Open, k.Help, k.Quit},
+		{k.Copy, k.Open, k.Share},
+		{k.Help, k.Quit},
 	}
 }
