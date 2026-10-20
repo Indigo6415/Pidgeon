@@ -181,6 +181,10 @@ git clone https://github.com/Indigo6415/pidgeon; cd pidgeon
 .\install.ps1 -AddToPath     # builds pidgeon.exe + pdgn.exe into %USERPROFILE%\go\bin
 ```
 
+If PowerShell refuses to run scripts, or you'd rather double-click, use
+`install.bat` instead. It runs `install.ps1` with the same arguments
+(`install.bat -AddToPath`) and bypasses the execution policy.
+
 Or use `go install github.com/Indigo6415/pidgeon/cmd/...@latest`, then add
 `%USERPROFILE%\go\bin` to your PATH. Open a new terminal afterwards.
 
