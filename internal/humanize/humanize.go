@@ -88,3 +88,18 @@ func ParseBytes(s string) (int64, error) {
 	}
 	return int64(v * mult), nil
 }
+
+// ParseRate reads a transfer rate such as "5M", "500K/s" or "2 MB/s"
+// (1024-based, like ParseBytes) into bytes per second.
+func ParseRate(s string) (int64, error) {
+	t := strings.TrimSpace(s)
+	// "/s" and "ps" are optional; the number and unit are what count.
+	for _, suf := range []string{"/s", "/S", "ps", "PS"} {
+		t = strings.TrimSuffix(t, suf)
+	}
+	n, err := ParseBytes(t)
+	if err != nil {
+		return 0, fmt.Errorf("%q is not a rate (try 5M or 500K)", s)
+	}
+	return n, nil
+}

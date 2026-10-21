@@ -1,6 +1,7 @@
 package server
 
 import (
+	"io/fs"
 	"mime"
 	"net/http"
 	"net/url"
@@ -29,19 +30,16 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	s.serveFile(w, r, name, "")
 }
 
-// serveFile streams the root-relative file name. share is the share link
-// it was reached through, if any.
+// serveFile streams the root-relative file name (which may be an entry
+// inside an archive). share is the share link it was reached through, if any.
 func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, name, share string) {
-	f, err := s.root.Open(name)
+	f, fi, err := s.openFile(name)
 	if err != nil {
 		httpError(w, err)
 		return
 	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		httpError(w, err)
-		return
+	if f != nil {
+		defer f.Close()
 	}
 	// Folders are browsed in the app, not downloaded through /f/.
 	if fi.IsDir() {
@@ -88,8 +86,26 @@ func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, name, share s
 		Share:    share,
 	})
 	cw := stats.NewCountingWriter(w, t)
+	cw.Ctx = r.Context()
 	http.ServeContent(cw, r, fi.Name(), fi.ModTime(), f)
+	// A file that changed (or was replaced) while it was being sent may
+	// have reached the client in an inconsistent state: flag it.
+	if cw.Status == http.StatusOK || cw.Status == http.StatusPartialContent {
+		if changedSince(f, fi.Size(), fi.ModTime()) || s.replaced(name, fi) {
+			t.MarkChanged()
+		}
+	}
 	s.cfg.Store.End(t, fileOutcome(cw, t, fi.Size()))
+}
+
+// replaced reports whether the path now names a different version of the
+// file than the one that was opened (it was rewritten or swapped out).
+func (s *Server) replaced(name string, was fs.FileInfo) bool {
+	if _, isArc := was.(arcInfo); isArc {
+		return false
+	}
+	now, err := s.root.Stat(name)
+	return err == nil && (now.Size() != was.Size() || !now.ModTime().Equal(was.ModTime()))
 }
 
 // overBudget reports whether --max-bytes has been reached.

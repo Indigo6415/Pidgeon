@@ -9,7 +9,7 @@ import "charm.land/bubbles/v2/key"
 type keyMap struct {
 	Up, Down, Enter, Actions, Back, Menu          key.Binding
 	Toggle, Focus, Cancel, Copy, Open, Help, Quit key.Binding
-	Share                                         key.Binding
+	Share, Pause                                  key.Binding
 }
 
 // defaultKeys returns the dashboard key bindings.
@@ -28,6 +28,7 @@ func defaultKeys() keyMap {
 		Copy:   key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "copy URL")),
 		Open:   key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "open in browser")),
 		Share:  key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "new share link")),
+		Pause:  key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "pause / resume transfer")),
 		Help:   key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "all keys")),
 		Quit:   key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	}
@@ -44,7 +45,8 @@ func (k keyMap) FullHelp() [][]key.Binding {
 		{k.Up, k.Down, k.Enter},
 		{k.Actions, k.Back, k.Menu},
 		{k.Toggle, k.Focus, k.Cancel},
-		{k.Copy, k.Open, k.Share},
+		{k.Pause, k.Copy, k.Open},
+		{k.Share},
 		{k.Help, k.Quit},
 	}
 }

@@ -24,12 +24,16 @@ type entry struct {
 	Size  int64  `json:"size"`  // bytes; 0 for directories
 	MTime int64  `json:"mtime"` // Unix milliseconds
 	Link  bool   `json:"link,omitempty"`
+	// Archive marks a .zip / .tar / .tar.gz file that can be browsed like a folder.
+	Archive bool `json:"archive,omitempty"`
 }
 
 // listing is the /api/ls response.
 type listing struct {
 	Path    string  `json:"path"` // "/" or "/a/b"
 	Entries []entry `json:"entries"`
+	Archive string  `json:"archive,omitempty"` // the archive this folder is inside, "/a/b.zip"
+	Partial bool    `json:"partial,omitempty"` // the archive was too big to index completely
 }
 
 // writeJSON writes v as a JSON response.
@@ -79,6 +83,13 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		info["maxBytes"] = s.cfg.MaxBytes
 		info["served"] = s.cfg.Store.BytesServed()
 	}
+	if s.thumbs != nil {
+		info["thumbs"] = true
+	}
+	// Several roots: the top level is a virtual folder of them.
+	if s.root.multi() {
+		info["roots"] = len(s.root.mounts)
+	}
 	writeJSON(w, http.StatusOK, info)
 }
 
@@ -98,13 +109,24 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	if name != "." {
 		out.Path = "/" + name
 	}
+	// Inside an archive the UI shows where the archive starts.
+	if arc, _, ok := s.splitArchive(name); ok {
+		out.Archive = "/" + arc
+		if ix, err := s.archive(arc); err == nil {
+			out.Partial = ix.partial
+		}
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 
 // list reads one root-relative directory, applying the visibility rules:
 // dotfiles are hidden unless --hidden, symlinks are followed only while they
 // stay inside the served root, and devices, sockets and pipes are left out.
+// An archive (or a folder inside one) is listed from its table of contents.
 func (s *Server) list(name string) ([]entry, error) {
+	if arc, inner, ok := s.splitArchive(name); ok {
+		return s.listArchive(arc, inner)
+	}
 	f, err := s.root.Open(name)
 	if err != nil {
 		return nil, err
@@ -119,7 +141,7 @@ func (s *Server) list(name string) ([]entry, error) {
 	// the served root (os.Root.Stat refuses ones that escape).
 	for _, de := range des {
 		n := de.Name()
-		if !s.cfg.ShowHidden && isHiddenName(n) {
+		if s.hidden(name, n) {
 			continue
 		}
 		e := entry{Name: n}
@@ -142,6 +164,7 @@ func (s *Server) list(name string) ([]entry, error) {
 		e.Dir = fi.IsDir()
 		if !e.Dir {
 			e.Size = fi.Size()
+			e.Archive = archiveKind(n) != arcNone
 		}
 		e.MTime = fi.ModTime().UnixMilli()
 		out = append(out, e)
@@ -219,6 +242,20 @@ func (s *Server) handlePeek(w http.ResponseWriter, r *http.Request) {
 // peek counts the visible entries of one folder and names its subfolders,
 // applying the same filtering rules as handleList.
 func (s *Server) peek(name string) (peekInfo, bool) {
+	// Folders inside archives are summarised from the index.
+	if arc, inner, ok := s.splitArchive(name); ok {
+		es, err := s.listArchive(arc, inner)
+		if err != nil {
+			return peekInfo{}, false
+		}
+		info := peekInfo{Items: len(es), Dirs: []string{}}
+		for _, e := range es {
+			if e.Dir {
+				info.Dirs = append(info.Dirs, e.Name)
+			}
+		}
+		return info, true
+	}
 	f, err := s.root.Open(name)
 	if err != nil {
 		return peekInfo{}, false
@@ -234,7 +271,7 @@ func (s *Server) peek(name string) (peekInfo, bool) {
 	// need a Stat, to learn the target's type (and to drop escaping links).
 	for _, de := range des {
 		n := de.Name()
-		if !s.cfg.ShowHidden && isHiddenName(n) {
+		if s.hidden(name, n) {
 			continue
 		}
 		t := de.Type()
@@ -282,6 +319,14 @@ func (s *Server) handleSize(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
+		// Inside an archive the index already has every size.
+		if arc, inner, ok := s.splitArchive(name); ok && inner != "" {
+			if b, n, err := s.archiveSize(arc, inner); err == nil {
+				total += b
+				files += n
+			}
+			continue
+		}
 		fs.WalkDir(s.fsys, name, func(p string, d fs.DirEntry, err error) error {
 			// Budget exhausted: report a partial total.
 			if seen++; seen > sizeMaxEntries || ctx.Err() != nil {
@@ -291,7 +336,7 @@ func (s *Server) handleSize(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return nil
 			}
-			if !s.cfg.ShowHidden && p != name && isHiddenName(d.Name()) {
+			if p != name && s.hidden(path.Dir(p), d.Name()) {
 				if d.IsDir() {
 					return fs.SkipDir
 				}
@@ -315,11 +360,14 @@ var clientIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
 
 // progressItem is one download in the progress feed.
 type progressItem struct {
-	ID    string  `json:"id"`
-	Sent  int64   `json:"sent"`
-	Total int64   `json:"total"`
-	Rate  float64 `json:"rate"`
-	State string  `json:"state"`
+	ID      string  `json:"id"`
+	Sent    int64   `json:"sent"`
+	Total   int64   `json:"total"`
+	Rate    float64 `json:"rate"`
+	State   string  `json:"state"`
+	Paused  bool    `json:"paused,omitempty"`  // held by the host
+	Limit   int64   `json:"limit,omitempty"`   // the tightest cap on it, bytes/sec
+	Changed bool    `json:"changed,omitempty"` // the file changed on disk mid-transfer
 }
 
 // handleEvents is a Server-Sent Events stream, one per open tab. It reports
@@ -381,7 +429,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		items := make([]progressItem, len(views))
 		// Translate stats views into the compact wire format.
 		for i, v := range views {
-			items[i] = progressItem{ID: v.DLID, Sent: v.Sent, Total: v.Total, Rate: math.Round(v.Rate), State: v.State.String()}
+			items[i] = progressItem{
+				ID: v.DLID, Sent: v.Sent, Total: v.Total, Rate: math.Round(v.Rate), State: v.State.String(),
+				Paused: v.Paused, Limit: s.cfg.Store.EffectiveLimit(v), Changed: v.Changed,
+			}
 		}
 		buf, _ := json.Marshal(items)
 		// Unchanged since the last push: maybe send a heartbeat instead.

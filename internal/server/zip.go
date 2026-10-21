@@ -5,6 +5,7 @@ import (
 	"compress/flate"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -39,12 +40,16 @@ type zipItem struct {
 	mode  fs.FileMode
 	mtime time.Time
 	data  []byte // generated content (the skipped-files note)
+	sums  bool   // the generated SHA256SUMS entry, written from the other items' hashes
 
-	// Stored archives remember each file's CRC-32 once it has been read, so
-	// a resumed download can skip the part already received without
-	// reading those files again. Guarded by zipJob.mu.
+	// Stored archives remember each file's CRC-32 (and SHA-256, when the
+	// archive lists them) once it has been read, so a resumed download can
+	// skip the part already received without reading those files again.
+	// Guarded by zipJob.mu.
 	crc   uint32
 	crcOK bool
+	sha   [32]byte
+	shaOK bool
 }
 
 // zipJob is a prepared selection. The browser POSTs the selection (which can
@@ -65,8 +70,18 @@ type zipJob struct {
 	skipped []string // entries that couldn't be planned, reported in the archive
 	store   bool     // every entry is stored: size is exact and ranges work
 	size    int64    // exact archive size when store, else -1
+	flat    bool     // each selected item sits at the top of the archive
+	sums    bool     // the archive ends with a SHA256SUMS file
 
 	mu sync.Mutex // guards the CRC cache in items
+}
+
+// zipOptions are the choices made when an archive is requested.
+type zipOptions struct {
+	Store bool   // never compress, so the size is known up front
+	Flat  bool   // put every selected item at the top level instead of keeping its path
+	Sums  bool   // add a SHA256SUMS file listing every file's hash
+	Name  string // archive name without ".zip"; "" picks one from the selection
 }
 
 // zipRequest is the /api/zip request body.
@@ -74,6 +89,9 @@ type zipRequest struct {
 	Base  string   `json:"base"`
 	Paths []string `json:"paths"`
 	Store bool     `json:"store"` // never compress, so the size is known up front
+	Flat  bool     `json:"flat"`  // selections from several folders: drop their paths
+	Sums  bool     `json:"sums"`  // include SHA256SUMS
+	Name  string   `json:"name"`  // archive name (optional)
 }
 
 // handleZipCreate validates a selection and returns a download URL for it.
@@ -102,7 +120,12 @@ func (s *Server) handleZipCreate(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "selection outside folder", http.StatusBadRequest)
 			return
 		}
-		if _, err := s.root.Stat(name); err != nil {
+		if _, err := s.stat(name); err != nil {
+			// Name the missing item: a basket can outlive the files in it.
+			if errors.Is(err, fs.ErrNotExist) {
+				http.Error(w, "not found: /"+name, http.StatusNotFound)
+				return
+			}
 			httpError(w, err)
 			return
 		}
@@ -112,7 +135,9 @@ func (s *Server) handleZipCreate(w http.ResponseWriter, r *http.Request) {
 			names = append(names, name)
 		}
 	}
-	job, err := s.newZipJob(r.Context(), base, names, req.Store)
+	names = dropNested(names)
+	opt := zipOptions{Store: req.Store, Flat: req.Flat, Sums: req.Sums, Name: req.Name}
+	job, err := s.newZipJob(r.Context(), base, names, opt)
 	if err != nil {
 		http.Error(w, "couldn't prepare the archive", http.StatusInternalServerError)
 		return
@@ -126,18 +151,41 @@ func (s *Server) handleZipCreate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// dropNested removes selected paths that sit inside another selected
+// folder, so nothing is archived twice.
+func dropNested(names []string) []string {
+	out := names[:0:0]
+	// Keep a name unless one of the others is its ancestor.
+	for _, n := range names {
+		nested := false
+		for _, o := range names {
+			if o != n && isUnder(n, o) {
+				nested = true
+				break
+			}
+		}
+		if !nested {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // newZipJob plans an archive of names (root-relative, all under base).
-// The archive is stored (exact size, resumable) when forceStore is set or
+// The archive is stored (exact size, resumable) when opt.Store is set or
 // when every file is already compressed and deflate would gain nothing.
-func (s *Server) newZipJob(ctx context.Context, base string, names []string, forceStore bool) (*zipJob, error) {
-	job := &zipJob{base: base, names: names, created: time.Now(), size: -1}
+func (s *Server) newZipJob(ctx context.Context, base string, names []string, opt zipOptions) (*zipJob, error) {
+	job := &zipJob{base: base, names: names, created: time.Now(), size: -1, flat: opt.Flat, sums: opt.Sums}
 	job.file = s.zipName(job)
+	if n := safeArchiveName(opt.Name); n != "" {
+		job.file = n + ".zip"
+	}
 	if err := s.planZip(ctx, job); err != nil {
 		return nil, err
 	}
-	job.store = forceStore
+	job.store = opt.Store
 	// Automatic store mode: nothing in the plan would be deflated anyway.
-	if !forceStore {
+	if !opt.Store {
 		job.store = true
 		for _, it := range job.items {
 			if !it.dir && !isCompressed(it.name) {
@@ -148,6 +196,11 @@ func (s *Server) newZipJob(ctx context.Context, base string, names []string, for
 	}
 	if !job.store {
 		return job, nil
+	}
+	// In a stored archive the hash list is a planned entry: every line has
+	// a fixed-length hash, so its size is known before any file is read.
+	if job.sums {
+		job.items = append(job.items, &zipItem{name: job.sumsName(), size: job.sumsSize(), mode: 0o644, mtime: time.Now(), sums: true})
 	}
 	// In a stored archive the skipped-files note is a planned entry too, so
 	// it is part of the computed size.
@@ -189,7 +242,7 @@ func (s *Server) addZipJob(job *zipJob) string {
 // selection, otherwise the containing folder's name.
 func (s *Server) zipName(j *zipJob) string {
 	if len(j.names) == 1 {
-		return path.Base(j.names[0]) + ".zip"
+		return strings.TrimSuffix(path.Base(j.names[0]), ".zip") + ".zip"
 	}
 	if j.base == "." {
 		return s.name + ".zip"
@@ -197,12 +250,40 @@ func (s *Server) zipName(j *zipJob) string {
 	return path.Base(j.base) + ".zip"
 }
 
+// safeArchiveName reduces a requested archive name to one safe file name
+// (no folders, no ".zip"); "" when nothing usable is left.
+func safeArchiveName(n string) string {
+	n = strings.TrimSuffix(strings.TrimSpace(path.Base(strings.ReplaceAll(n, "\\", "/"))), ".zip")
+	if n == "." || n == "/" || strings.HasPrefix(n, ".") || len(n) > 120 || !utf8.ValidString(n) {
+		return ""
+	}
+	return n
+}
+
 // planZip walks the selection into job.items. Entry names are relative to
 // the folder the selection was made in, so the archive extracts with the
-// tree intact; empty folders get explicit entries.
+// tree intact; empty folders get explicit entries. A flat archive instead
+// puts each selected item at the top (names that clash get " (2)"), which
+// suits a basket collected from many folders.
 func (s *Server) planZip(ctx context.Context, job *zipJob) error {
+	used := map[string]bool{}
 	// Walk each selected item in turn.
 	for _, top := range job.names {
+		rename := func(p string) string { return relTo(job.base, p) }
+		if job.flat {
+			short := uniqueIn(used, path.Base(top))
+			rename = func(p string) string { return short + strings.TrimPrefix(p, top) }
+		}
+		// Items inside an archive come from its index.
+		if arc, inner, ok := s.splitArchive(top); ok && inner != "" {
+			if err := s.planArchive(ctx, job, top, arc, inner, rename); err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				job.skipped = append(job.skipped, top+": "+err.Error())
+			}
+			continue
+		}
 		err := fs.WalkDir(s.fsys, top, func(p string, d fs.DirEntry, err error) error {
 			// Unreadable entries are noted and skipped, not fatal.
 			if err != nil {
@@ -215,13 +296,13 @@ func (s *Server) planZip(ctx context.Context, job *zipJob) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if !s.cfg.ShowHidden && p != top && isHiddenName(d.Name()) {
+			if p != top && s.hidden(path.Dir(p), d.Name()) {
 				if d.IsDir() {
 					return fs.SkipDir
 				}
 				return nil
 			}
-			rel := relTo(job.base, p)
+			rel := rename(p)
 			fi, err := fs.Stat(s.fsys, p) // follows in-root symlinks only
 			if err != nil {
 				job.skipped = append(job.skipped, p+": "+err.Error())
@@ -243,6 +324,85 @@ func (s *Server) planZip(ctx context.Context, job *zipJob) error {
 		}
 	}
 	return nil
+}
+
+// uniqueIn returns n, or "n (2)", "n (3)", ... whichever isn't in used yet,
+// and marks it used.
+func uniqueIn(used map[string]bool, n string) string {
+	c := n
+	stem, ext := splitExt(n)
+	// Count up until a free name turns up.
+	for i := 2; used[c]; i++ {
+		c = fmt.Sprintf("%s (%d)%s", stem, i, ext)
+	}
+	used[c] = true
+	return c
+}
+
+// sumsName is the hash list's name: SHA256SUMS, unless the selection
+// already has a file of that name at the top.
+func (job *zipJob) sumsName() string {
+	// Look for a clash among the planned top-level names.
+	for _, it := range job.items {
+		if it.name == "SHA256SUMS" {
+			return brand.Name + "-SHA256SUMS"
+		}
+	}
+	return "SHA256SUMS"
+}
+
+// sumsLine is one line of SHA256SUMS in the format sha256sum -c reads.
+// Names with a backslash or newline are escaped as sha256sum does.
+func sumsLine(sum [32]byte, name string) string {
+	prefix := ""
+	if strings.ContainsAny(name, "\\\n\r") {
+		prefix = "\\"
+		name = strings.NewReplacer("\\", "\\\\", "\n", "\\n", "\r", "\\r").Replace(name)
+	}
+	return prefix + hex.EncodeToString(sum[:]) + "  " + name + "\n"
+}
+
+// sumsSize is the exact length of SHA256SUMS for the planned files.
+func (job *zipJob) sumsSize() int64 {
+	var n int64
+	// Hashes have a fixed length, so only the names vary.
+	for _, it := range job.items {
+		if !it.dir && it.src != "" {
+			n += int64(len(sumsLine([32]byte{}, it.name)))
+		}
+	}
+	return n
+}
+
+// sumsData builds SHA256SUMS from the hashes recorded while the files were
+// written. Every file before it in the plan has been read by then.
+func (job *zipJob) sumsData() ([]byte, error) {
+	var b strings.Builder
+	job.mu.Lock()
+	defer job.mu.Unlock()
+	// One line per file, in archive order.
+	for _, it := range job.items {
+		if it.dir || it.src == "" {
+			continue
+		}
+		if !it.shaOK {
+			return nil, fmt.Errorf("%s: hash missing", it.src)
+		}
+		b.WriteString(sumsLine(it.sha, it.name))
+	}
+	return []byte(b.String()), nil
+}
+
+// changedSince reports whether an open file no longer has the size and
+// modification time it was planned with. Entries without a Stat (inside
+// archives) are never reported.
+func changedSince(f any, size int64, mtime time.Time) bool {
+	st, ok := f.(interface{ Stat() (fs.FileInfo, error) })
+	if !ok {
+		return false
+	}
+	fi, err := st.Stat()
+	return err == nil && (fi.Size() != size || !fi.ModTime().Equal(mtime))
 }
 
 // handleZipStream serves a prepared archive.
@@ -321,6 +481,7 @@ func (s *Server) serveZip(w http.ResponseWriter, r *http.Request, job *zipJob, t
 		Share:    share,
 	})
 	cw := stats.NewCountingWriter(w, t)
+	cw.Ctx = r.Context()
 	cw.WriteHeader(status)
 
 	var err error
@@ -393,22 +554,35 @@ func (s *Server) writeStoredZip(ctx context.Context, out io.Writer, t *stats.Tra
 			return errRangeDone
 		}
 		job.mu.Lock()
-		crc, known := it.crc, it.crcOK
+		crc, known, hashed := it.crc, it.crcOK, it.shaOK || !job.sums || it.src == ""
 		job.mu.Unlock()
 		switch {
 		case dry:
 			err = writeZeros(fw, it.size, zeros)
 		case it.data != nil:
 			_, err = fw.Write(it.data)
-		case known && dataStart+it.size <= skipBefore:
+		case known && hashed && dataStart+it.size <= skipBefore:
 			// Already delivered before a resume: the bytes are discarded
 			// anyway, so stand-ins of the right length will do.
 			err = writeZeros(fw, it.size, zeros)
+		case it.sums:
+			var data []byte
+			if data, err = job.sumsData(); err == nil {
+				_, err = fw.Write(data)
+				crc = crc32.ChecksumIEEE(data)
+				job.mu.Lock()
+				it.crc, it.crcOK = crc, true
+				job.mu.Unlock()
+			}
 		default:
-			crc, err = s.copyStored(fw, it, buf)
+			var sum [32]byte
+			crc, sum, err = s.copyStored(fw, it, buf, t, job.sums)
 			if err == nil {
 				job.mu.Lock()
 				it.crc, it.crcOK = crc, true
+				if job.sums {
+					it.sha, it.shaOK = sum, true
+				}
 				job.mu.Unlock()
 			}
 		}
@@ -423,23 +597,36 @@ func (s *Server) writeStoredZip(ctx context.Context, out io.Writer, t *stats.Tra
 }
 
 // copyStored copies exactly it.size bytes of a file into w and returns their
-// CRC-32. A file that shrank since it was planned can't fill its entry and
-// fails the archive; one that grew is cut at the planned size.
-func (s *Server) copyStored(w io.Writer, it *zipItem, buf []byte) (uint32, error) {
-	f, err := s.fsys.Open(it.src)
+// CRC-32 (and SHA-256 when withSum). A file that shrank since it was planned
+// can't fill its entry and fails the archive; one that grew is cut at the
+// planned size, and the transfer is flagged as having changed.
+func (s *Server) copyStored(w io.Writer, it *zipItem, buf []byte, t *stats.Transfer, withSum bool) (crc uint32, sum [32]byte, err error) {
+	f, _, err := s.openFile(it.src)
 	if err != nil {
-		return 0, err
+		return 0, sum, err
+	}
+	if f == nil {
+		return 0, sum, errNotDir
 	}
 	defer f.Close()
-	h := crc32.NewIEEE()
-	n, err := io.CopyBuffer(io.MultiWriter(w, h), io.LimitReader(onlyReader{f}, it.size), buf)
+	c := crc32.NewIEEE()
+	dst := io.MultiWriter(w, c)
+	h := sha256.New()
+	if withSum {
+		dst = io.MultiWriter(w, c, h)
+	}
+	n, err := io.CopyBuffer(dst, io.LimitReader(onlyReader{f}, it.size), buf)
 	if err != nil {
-		return 0, err
+		return 0, sum, err
 	}
 	if n < it.size {
-		return 0, fmt.Errorf("%s changed while it was being archived", it.src)
+		return 0, sum, fmt.Errorf("%s changed while it was being archived", it.src)
 	}
-	return h.Sum32(), nil
+	if t != nil && changedSince(f, it.size, it.mtime) {
+		t.MarkChanged()
+	}
+	copy(sum[:], h.Sum(nil))
+	return c.Sum32(), sum, nil
 }
 
 // writeDeflateZip streams a compressed archive from the plan. Sizes aren't
@@ -454,6 +641,7 @@ func (s *Server) writeDeflateZip(ctx context.Context, w io.Writer, t *stats.Tran
 	})
 	buf := make([]byte, 256<<10)
 	skipped := append([]string(nil), job.skipped...)
+	var sums strings.Builder
 	// One entry at a time, in plan order.
 	for _, it := range job.items {
 		// Stop promptly if the client left or the operator cancelled.
@@ -469,8 +657,11 @@ func (s *Server) writeDeflateZip(ctx context.Context, w io.Writer, t *stats.Tran
 			}
 			continue
 		}
-		f, err := s.fsys.Open(it.src)
+		f, _, err := s.openFile(it.src)
 		// Open before writing the header so an unreadable file is just skipped.
+		if err == nil && f == nil {
+			err = errNotDir
+		}
 		if err != nil {
 			skipped = append(skipped, it.src+": "+err.Error())
 			continue
@@ -482,12 +673,35 @@ func (s *Server) writeDeflateZip(ctx context.Context, w io.Writer, t *stats.Tran
 			fh.Method = zip.Store
 		}
 		fw, err := zw.CreateHeader(fh)
+		h := sha256.New()
 		if err == nil {
 			// A read error mid-file would leave a corrupt entry, so it is fatal.
-			_, err = io.CopyBuffer(fw, onlyReader{f}, buf)
+			dst := fw
+			if job.sums {
+				dst = io.MultiWriter(fw, h)
+			}
+			_, err = io.CopyBuffer(dst, onlyReader{f}, buf)
+		}
+		if err == nil && changedSince(f, it.size, it.mtime) {
+			t.MarkChanged()
 		}
 		f.Close()
 		if err != nil {
+			return err
+		}
+		if job.sums {
+			var sum [32]byte
+			copy(sum[:], h.Sum(nil))
+			sums.WriteString(sumsLine(sum, it.name))
+		}
+	}
+	// The hash list covers exactly the files that made it in.
+	if job.sums {
+		fw, err := zw.Create(job.sumsName())
+		if err != nil {
+			return err
+		}
+		if _, err := io.WriteString(fw, sums.String()); err != nil {
 			return err
 		}
 	}

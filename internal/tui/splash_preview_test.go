@@ -69,6 +69,15 @@ func TestDashboardPreview(t *testing.T) {
 	srv.CreateShare("/", time.Hour, 3)
 	u := st.Begin(stats.TransferInfo{Client: "192.168.1.33", Name: "/Inbox/IMG_2041.HEIC", Kind: stats.KindUpload, Total: 4 << 20})
 	u.Add(3 << 20)
+	// A speed cap, a paused download and one whose file changed mid-way.
+	st.SetLimit(5 << 20)
+	p := st.Begin(stats.TransferInfo{Client: "192.168.1.40", Name: "/Movies/trip.mp4", Total: 900 << 20})
+	p.Add(410 << 20)
+	st.Pause(p.ID)
+	c := st.Begin(stats.TransferInfo{Client: "192.168.1.33", Name: "/build/app.log", Total: 2 << 20})
+	c.Add(2 << 20)
+	c.MarkChanged()
+	st.End(c, stats.Completed)
 	dash := newDashboard(Options{Store: st, Manager: mgr, Dir: "/Users/someone/Downloads", AuthMode: "open",
 		Server: srv, Devices: reg, Limits: Limits{Deadline: time.Now().Add(29 * time.Minute)}})
 	dash.th = newTheme(true, hex("#0d1117"))

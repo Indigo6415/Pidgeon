@@ -32,6 +32,8 @@ pidgeon -p 9000          # another port (auto-increments if taken)
 pidgeon --token auto     # require a random access token (included in the QR link)
 pidgeon --bind all       # listen on every interface (0.0.0.0) from the start
 pidgeon --headless       # no dashboard, just URLs + a request log
+pidgeon ~/Movies ~/Photos report.pdf   # several folders and files side by side
+pidgeon --limit 5M       # cap downloads at 5 MB/s in total (--client-limit caps each device)
 ```
 
 | Flag | Default | Meaning |
@@ -43,7 +45,14 @@ pidgeon --headless       # no dashboard, just URLs + a request log
 | `--hidden` | off | Also serve dotfiles and dot-directories. These are hidden by default. |
 | `--no-splash` | off | Skip the startup animation. |
 | `--headless` | auto | Run without the dashboard. This is automatic when stdin or stdout isn't a terminal (pipes, systemd, `docker run` without `-t`) or when started in the background with `&`. |
+| `--limit` | — | Cap the total download speed, e.g. `5M` (per second). Changeable live from the dashboard. |
+| `--client-limit` | — | Cap each device's download speed, e.g. `2M`. |
+| `--no-thumbs` | off | Don't make image thumbnails for the grid view. Thumbnails are cached in your user cache folder, never in the served folder. |
 | `--version` | | Print the version and exit. |
+
+Several paths (`pidgeon ~/Movies ~/Photos report.pdf`) are served side by side:
+each becomes a top-level entry, with `Photos (2)` for clashing names. Each one
+gets its own `os.Root`, so nothing outside them is reachable.
 
 Before the dashboard opens, every URL is printed to the terminal, so they stay in
 your scrollback after you quit. The splash is skipped when you pass `--no-splash`,
@@ -57,11 +66,11 @@ Everything works with the arrow keys, Enter and Esc alone:
 |---|---|
 | `↑` `↓` | Move through the listeners, then on down into the transfers (one continuous list) |
 | `enter` | On a listener, turn it on or off live. On a transfer, open its actions (cancel). |
-| `→` | Actions for the selected row: enable or disable, copy URL, open in browser, cancel transfer |
-| `esc` | Main menu: show all keys, or quit. `esc` (or `←`) also closes any open menu. |
+| `→` | Actions for the selected row: enable or disable, copy URL, open in browser; for a transfer pause, limit speed or cancel |
+| `esc` | Main menu: show all keys, bandwidth limits, or quit. `esc` (or `←`) also closes any open menu. |
 
 Letter shortcuts for the same actions: `space` toggle, `tab` switch panel,
-`x` cancel transfer, `c` copy URL (OSC 52 clipboard), `o` open in browser,
+`x` cancel transfer, `p` pause or resume transfer, `c` copy URL (OSC 52 clipboard), `o` open in browser,
 `?` all keys, `q` quit. If downloads are in progress, `q` asks you to press it
 again, and the quit item in the Esc menu shows how many will be cancelled.
 `ctrl+c` always quits immediately.
@@ -122,7 +131,8 @@ slide-out drawer, rows get bigger, and downloads open as a bottom sheet.
 | `⌘↑` / `Alt+↑` / `Backspace` | Go to the parent folder |
 | `⌘A`, `Esc` | Select all, clear the selection |
 | Click, `⌘`-click, `Shift`-click | Select, toggle, select range. Folders open on click; files download on double-click. |
-| Right-click | Download, Open Preview, Copy Link, **Copy as cURL** |
+| Right-click | Download, Open Preview, Add to Basket, Copy Link, **Copy as cURL**, Show SHA-256 |
+| `⇧B` | Add the selection to the basket, or take it out |
 
 ### Downloads in the browser
 
@@ -216,6 +226,8 @@ That's fine on your home Wi-Fi and wrong on a café network.
 What's always enforced:
 
 - The server is read-only. There are no upload, delete or rename endpoints.
+  Archives (`.zip`, `.tar`, `.tar.gz`) are browsed by reading them in place;
+  nothing is ever extracted to disk.
 - All file access goes through Go's `os.Root`, which refuses `..` traversal and
   symlinks that point outside the served directory.
 - Dotfiles and dot-directories (`.git`, `.env`, `.ssh`, …) are hidden and refused

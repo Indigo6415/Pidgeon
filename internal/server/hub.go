@@ -86,7 +86,7 @@ func (s *Server) Send(ip, p string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	fi, err := s.root.Stat(name)
+	fi, err := s.stat(name)
 	if err != nil {
 		return 0, err
 	}

@@ -28,10 +28,11 @@ type Options struct {
 	Ctx      context.Context // cancelled on SIGTERM/SIGINT: quits the TUI
 	Store    *stats.Store
 	Manager  *listeners.Manager
-	Dir      string // absolute served directory
-	Token    string // appended to shared URLs (QR, copy, open) when set
-	AuthMode string // "open", "token", "basic", "token + basic"
-	Splash   bool   // play the startup splash
+	Dir      string   // absolute served directory (several, comma-separated)
+	Roots    []string // every served path, when there are several
+	Token    string   // appended to shared URLs (QR, copy, open) when set
+	AuthMode string   // "open", "token", "basic", "token + basic"
+	Splash   bool     // play the startup splash
 	URLs     []string
 
 	Server  *server.Server    // share links, sending files, the file picker; optional

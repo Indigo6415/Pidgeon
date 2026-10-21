@@ -39,7 +39,7 @@ func (s *Server) openInbox(dir string) error {
 	s.cfg.Inbox = abs
 	// An inbox inside the served folder can also be browsed (and watched
 	// live), unless it is hidden from listings.
-	if rel, ok := within(s.cfg.Dir, abs); ok {
+	if rel, ok := s.root.rel(abs); ok {
 		if _, err := s.resolve(rel); err == nil {
 			s.inboxRel = rel
 		}

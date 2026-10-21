@@ -1,6 +1,7 @@
 package stats
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -56,6 +57,7 @@ func (r *ResponseRecorder) Unwrap() http.ResponseWriter { return r.ResponseWrite
 type CountingWriter struct {
 	http.ResponseWriter
 	T           *Transfer
+	Ctx         context.Context // the request's context: ends a pause or a wait when the client leaves
 	wroteHeader bool
 	Status      int
 }
@@ -89,9 +91,31 @@ func (w *CountingWriter) Write(p []byte) (int, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
-	n, err := w.ResponseWriter.Write(p)
-	w.T.Add(n)
-	return n, err
+	// Fast path: nothing is holding this transfer back.
+	if !w.T.limited() {
+		n, err := w.ResponseWriter.Write(p)
+		w.T.Add(n)
+		return n, err
+	}
+	// Paused or capped: send in small paced pieces so the rate is smooth
+	// and a pause takes effect promptly.
+	written := 0
+	for written < len(p) {
+		size := len(p) - written
+		if rate := w.T.slowest(); rate > 0 {
+			size = min(size, chunk(rate))
+		}
+		if err := w.T.pace(w.Ctx, size); err != nil {
+			return written, err
+		}
+		n, err := w.ResponseWriter.Write(p[written : written+size])
+		w.T.Add(n)
+		written += n
+		if err != nil {
+			return written, err
+		}
+	}
+	return written, nil
 }
 
 // Flush forwards to the underlying writer.
@@ -117,6 +141,15 @@ func (r *CountingReader) Read(p []byte) (int, error) {
 	// A cancel from the dashboard stops the upload at the next read.
 	if r.T.Cancelled() {
 		return 0, ErrCancelled
+	}
+	// Paused or capped from the dashboard: read in paced pieces.
+	if r.T.limited() {
+		if rate := r.T.slowest(); rate > 0 {
+			p = p[:min(len(p), chunk(rate))]
+		}
+		if err := r.T.pace(context.Background(), len(p)); err != nil {
+			return 0, err
+		}
 	}
 	n, err := r.R.Read(p)
 	r.T.Add(n)

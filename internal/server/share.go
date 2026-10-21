@@ -99,7 +99,7 @@ func (s *Server) CreateShare(p string, ttl time.Duration, maxUses int) (Share, e
 	if err != nil {
 		return Share{}, err
 	}
-	fi, err := s.root.Stat(name)
+	fi, err := s.stat(name)
 	if err != nil {
 		return Share{}, err
 	}
@@ -248,7 +248,7 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 		s.shareError(w, http.StatusNotFound, "Not found.", "")
 		return
 	}
-	fi, err := s.root.Stat(name)
+	fi, err := s.stat(name)
 	if err != nil {
 		s.shareError(w, http.StatusNotFound, "Not found.", "")
 		return
@@ -317,7 +317,7 @@ func (s *Server) serveShareZip(w http.ResponseWriter, r *http.Request, id, name 
 			base = name[:i]
 		}
 		var err error
-		job, err = s.newZipJob(r.Context(), base, names, false)
+		job, err = s.newZipJob(r.Context(), base, names, zipOptions{})
 		if err != nil {
 			http.Error(w, "couldn't prepare the archive", http.StatusInternalServerError)
 			return

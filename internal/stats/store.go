@@ -83,6 +83,12 @@ type Transfer struct {
 	state     atomic.Uint32
 	cancelled atomic.Bool
 	ended     atomic.Int64 // UnixNano
+	paused    atomic.Bool  // the operator is holding this transfer
+	changed   atomic.Bool  // the file changed on disk while it was being sent
+
+	limit  Limiter  // this transfer's own cap, set from the dashboard
+	client *Limiter // the cap shared by every transfer to the same device
+	store  *Store
 
 	lastSent int64 // sampler-only
 }
@@ -102,6 +108,10 @@ func (t *Transfer) Total() int64 { return t.total.Load() }
 // Cancelled reports whether the operator asked to kill this transfer.
 func (t *Transfer) Cancelled() bool { return t.cancelled.Load() }
 
+// MarkChanged records that the file being sent was modified (or replaced)
+// on disk during the transfer, so the copy received may be inconsistent.
+func (t *Transfer) MarkChanged() { t.changed.Store(true) }
+
 // View is an immutable copy of a transfer for rendering.
 type View struct {
 	TransferInfo
@@ -112,6 +122,9 @@ type View struct {
 	Sent    int64
 	Rate    float64
 	State   State
+	Paused  bool  // held by the operator
+	Limit   int64 // the transfer's own cap in bytes/sec, 0 = none
+	Changed bool  // the file changed on disk while it was being sent
 }
 
 // Progress returns 0..1, or -1 if the total is unknown.
@@ -132,6 +145,9 @@ func (t *Transfer) view() View {
 		Sent:         t.sent.Load(),
 		Rate:         math.Float64frombits(t.rateBits.Load()),
 		State:        State(t.state.Load()),
+		Paused:       t.paused.Load(),
+		Limit:        t.limit.Rate(),
+		Changed:      t.changed.Load(),
 	}
 	if e := t.ended.Load(); e != 0 {
 		v.Ended = time.Unix(0, e)
@@ -171,6 +187,8 @@ type Snapshot struct {
 	HottestHits int64
 	// ActiveByListener counts active transfers per listener ID.
 	ActiveByListener map[string]int
+	Limit            int64 // cap on all downloads in bytes/sec, 0 = none
+	ClientLimit      int64 // cap per device in bytes/sec, 0 = none
 }
 
 // Store aggregates all server activity.
@@ -186,7 +204,11 @@ type Store struct {
 	peakConns   atomic.Int64
 	nextID      atomic.Uint64
 
+	global     Limiter      // cap on all downloads together
+	clientRate atomic.Int64 // cap per device; applied to each new device's bucket
+
 	mu        sync.Mutex
+	clients   map[string]*Limiter // per-device buckets, by IP
 	transfers map[uint64]*Transfer
 	hits      map[string]int64
 	log       []LogEntry // ring buffer
@@ -211,6 +233,7 @@ func New() *Store {
 	return &Store{
 		started:    now,
 		transfers:  map[uint64]*Transfer{},
+		clients:    map[string]*Limiter{},
 		hits:       map[string]int64{},
 		log:        make([]LogEntry, logSize),
 		bucketFrom: now,
@@ -251,10 +274,11 @@ func (s *Store) BytesServed() int64 { return s.bytesServed.Load() }
 
 // Begin registers a new transfer.
 func (s *Store) Begin(info TransferInfo) *Transfer {
-	t := &Transfer{TransferInfo: info, ID: s.nextID.Add(1), Started: time.Now()}
+	t := &Transfer{TransferInfo: info, ID: s.nextID.Add(1), Started: time.Now(), store: s}
 	t.total.Store(info.Total)
 	s.mu.Lock()
 	s.transfers[t.ID] = t
+	t.client = s.clientLimiterLocked(info.Client)
 	s.mu.Unlock()
 	return t
 }
@@ -295,6 +319,7 @@ func (s *Store) End(t *Transfer, o Outcome) {
 	}
 	t.ended.Store(time.Now().UnixNano())
 	t.rateBits.Store(0)
+	t.paused.Store(false)
 	// Uploads have their own counter; they are not downloads.
 	if o == Completed && t.Kind == KindUpload {
 		s.uploads.Add(1)
@@ -455,6 +480,8 @@ func (s *Store) Snapshot() Snapshot {
 		OpenConns:        max(0, s.openConns.Load()),
 		PeakConns:        s.peakConns.Load(),
 		ActiveByListener: map[string]int{},
+		Limit:            s.global.Rate(),
+		ClientLimit:      s.clientRate.Load(),
 	}
 
 	s.mu.Lock()

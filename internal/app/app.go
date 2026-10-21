@@ -39,7 +39,7 @@ const shutdownGrace = 3 * time.Second
 
 // config is the parsed command line.
 type config struct {
-	dir      string
+	paths    []string // directories and files to serve; one directory is the usual case
 	port     int
 	bind     string
 	token    string
@@ -55,6 +55,10 @@ type config struct {
 	expire   time.Duration // stop after this long; 0 = never
 	once     bool          // stop after the first completed download
 	maxBytes string        // stop once this much has been served, e.g. "5G"
+
+	limit       string // cap on all downloads together, e.g. "5M" (per second)
+	clientLimit string // cap on each device's downloads
+	noThumbs    bool   // no image thumbnails in the web UI's grid view
 }
 
 // Reasons the server stops on its own (--expire, --once, --max-bytes); the
@@ -109,9 +113,12 @@ func parseFlags(args []string, stderr io.Writer) (config, int) {
 	fs.DurationVar(&c.expire, "expire", 0, "stop serving after this long, e.g. 30m or 2h")
 	fs.BoolVar(&c.once, "once", false, "stop after the first completed download")
 	fs.StringVar(&c.maxBytes, "max-bytes", "", "stop once this much has been served, e.g. 5G")
+	fs.StringVar(&c.limit, "limit", "", "cap the total download speed, e.g. 5M (per second; changeable in the dashboard)")
+	fs.StringVar(&c.clientLimit, "client-limit", "", "cap each device's download speed, e.g. 2M (per second)")
+	fs.BoolVar(&c.noThumbs, "no-thumbs", false, "don't generate image thumbnails for the web UI's grid view")
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "%s — %s\n\n", brand.Name, brand.Tagline)
-		fmt.Fprintf(stderr, "Usage:\n  %s [flags] [directory]\n  %s pull <url> [target-dir]   (preview)\n\n", brand.Command, brand.Command)
+		fmt.Fprintf(stderr, "Usage:\n  %s [flags] [directory]\n  %s [flags] <path> <path>...   (several folders and files side by side)\n  %s pull <url> [target-dir]   (preview)\n\n", brand.Command, brand.Command, brand.Command)
 		fmt.Fprintf(stderr, "%s is the same program as %s.\n\nFlags:\n", brand.Alias, brand.Command)
 		fs.PrintDefaults()
 	}
@@ -122,27 +129,36 @@ func parseFlags(args []string, stderr io.Writer) (config, int) {
 		}
 		return c, 2
 	}
-	switch fs.NArg() {
-	case 0:
-		c.dir = "."
-	case 1:
-		c.dir = fs.Arg(0)
-	default:
-		fmt.Fprintln(stderr, "too many arguments: expected at most one directory")
-		return c, 2
+	c.paths = fs.Args()
+	// No path: serve the current directory.
+	if len(c.paths) == 0 {
+		c.paths = []string{"."}
 	}
 	return c, -1
 }
 
 // serve runs the server until the user quits or a signal arrives.
 func serve(cfg config, stdout, stderr io.Writer) error {
-	dir, err := filepath.Abs(cfg.dir)
-	if err != nil {
-		return err
+	paths := make([]string, len(cfg.paths))
+	// Every path must exist; one path on its own must be a directory, and
+	// several become top-level entries of a virtual root.
+	for i, p := range cfg.paths {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			return err
+		}
+		fi, err := os.Stat(abs)
+		switch {
+		case err != nil:
+			return fmt.Errorf("%s: no such file or directory", p)
+		case len(cfg.paths) == 1 && !fi.IsDir():
+			// A single file is served on its own, like several paths.
+		case !fi.IsDir() && !fi.Mode().IsRegular():
+			return fmt.Errorf("%s is not a file or directory", p)
+		}
+		paths[i] = abs
 	}
-	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
-		return fmt.Errorf("%s is not a directory", cfg.dir)
-	}
+	dir := describePaths(paths)
 
 	// Access control.
 	token := cfg.token
@@ -160,6 +176,10 @@ func serve(cfg config, stdout, stderr io.Writer) error {
 
 	// Session limits and the inbox.
 	lim, err := parseLimits(cfg)
+	if err != nil {
+		return err
+	}
+	rates, err := parseRates(cfg)
 	if err != nil {
 		return err
 	}
@@ -189,6 +209,8 @@ func serve(cfg config, stdout, stderr io.Writer) error {
 	defer finish(nil)
 
 	store := stats.New()
+	store.SetLimit(rates[0])
+	store.SetClientLimit(rates[1])
 	// Headless mode prints each request as it completes. This must be set
 	// before any listener starts serving.
 	if !interactive {
@@ -204,7 +226,7 @@ func serve(cfg config, stdout, stderr io.Writer) error {
 	reg := devices.New(cfg.ask, devices.TrustFile(brand.Command))
 	var mgr *listeners.Manager
 	srv, err := server.New(server.Config{
-		Dir: dir, ShowHidden: cfg.hidden, Token: token,
+		Paths: paths, ShowHidden: cfg.hidden, Token: token, NoThumbs: cfg.noThumbs,
 		BasicUser: user, BasicPass: pass, Store: store, Assets: web.Assets(),
 		Devices: reg, Inbox: cfg.inbox, InboxMax: inboxMax,
 		MaxBytes: lim.MaxBytes, Expires: lim.Deadline, Once: lim.Once,
@@ -233,7 +255,7 @@ func serve(cfg config, stdout, stderr io.Writer) error {
 
 	infos := mgr.List()
 	urls := printBanner(stdout, dir, infos, token, authMode(token, user))
-	printExtras(stdout, srv.Inbox(), inboxMax, cfg.ask, lim)
+	printExtras(stdout, srv.Inbox(), inboxMax, cfg.ask, lim, rates)
 	reportBindErrors(stderr, infos)
 	go watchLimits(ctx, finish, store, lim)
 
@@ -241,7 +263,7 @@ func serve(cfg config, stdout, stderr io.Writer) error {
 	if interactive {
 		splash := !cfg.noSplash && os.Getenv("NO_COLOR") == ""
 		err = tui.Run(tui.Options{
-			Ctx: ctx, Store: store, Manager: mgr, Dir: dir, Token: token,
+			Ctx: ctx, Store: store, Manager: mgr, Dir: dir, Roots: paths, Token: token,
 			AuthMode: authMode(token, user), Splash: splash, URLs: urls,
 			Server: srv, Devices: reg, Limits: lim,
 		})
@@ -274,6 +296,29 @@ func serve(cfg config, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "received %d upload(s), %s, in %s\n", snap.Uploads, humanize.Bytes(snap.BytesRecv), srv.Inbox())
 	}
 	return err
+}
+
+// parseRates reads --limit and --client-limit (bytes per second; 0 = none).
+func parseRates(cfg config) ([2]int64, error) {
+	var out [2]int64
+	// Same rules for both flags.
+	for i, f := range []struct{ name, val string }{{"--limit", cfg.limit}, {"--client-limit", cfg.clientLimit}} {
+		if f.val == "" {
+			continue
+		}
+		n, err := humanize.ParseRate(f.val)
+		if err != nil || n <= 0 {
+			return out, fmt.Errorf("%s: %q is not a positive rate (try 5M)", f.name, f.val)
+		}
+		out[i] = n
+	}
+	return out, nil
+}
+
+// describePaths names what is served: the directory, or the paths
+// comma-separated when there are several.
+func describePaths(paths []string) string {
+	return strings.Join(paths, ", ")
 }
 
 // parseLimits reads --expire, --once and --max-bytes.
@@ -330,7 +375,7 @@ func watchLimits(ctx context.Context, finish context.CancelCauseFunc, st *stats.
 }
 
 // printExtras lists the optional features in the startup banner.
-func printExtras(w io.Writer, inbox string, inboxMax int64, ask bool, lim tui.Limits) {
+func printExtras(w io.Writer, inbox string, inboxMax int64, ask bool, lim tui.Limits, rates [2]int64) {
 	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("#8b949e"))
 	bold := lipgloss.NewStyle().Bold(true)
 	printed := false
@@ -348,6 +393,17 @@ func printExtras(w io.Writer, inbox string, inboxMax int64, ask bool, lim tui.Li
 	}
 	if s := lim.Describe(); s != "" {
 		lipgloss.Fprintln(w, "  stops "+bold.Render(s))
+		printed = true
+	}
+	if rates[0] > 0 || rates[1] > 0 {
+		var parts []string
+		if rates[0] > 0 {
+			parts = append(parts, humanize.Rate(float64(rates[0]))+" total")
+		}
+		if rates[1] > 0 {
+			parts = append(parts, humanize.Rate(float64(rates[1]))+" per device")
+		}
+		lipgloss.Fprintln(w, "  speed limit: "+bold.Render(strings.Join(parts, ", "))+muted.Render("  (change it from the dashboard's esc menu)"))
 		printed = true
 	}
 	if printed {

@@ -11,6 +11,10 @@
 // (?dl=<client>.<n>) and /api/events reports the bytes the server has sent.
 // The same event stream tells the page when the folder it shows changes on
 // disk, and delivers files the host sends from the terminal dashboard.
+//
+// Archives (.zip, .tar, .tar.gz) open like folders; the server reads them in
+// place. The grid view shows thumbnails of images. The basket collects files
+// and folders from anywhere in the tree into one ZIP.
 
 const $ = (sel, el = document) => el.querySelector(sel);
 const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
@@ -39,6 +43,13 @@ const state = {
   fresh: new Set(),        // names that just appeared in this folder (highlighted)
   reveal: null,            // name to put the cursor on once the next folder shows
   zipStore: loadJSON("zipStore", false), // never compress ZIPs: exact size, resumable
+  zipSums: loadJSON("zipSums", false),   // add SHA256SUMS to ZIPs
+  arcOf: new Map(),        // folder path -> the archive it is inside ("" if none)
+  partialArc: new Set(),   // archive folders whose listing is incomplete
+  thumbFail: new Set(),    // image paths the server couldn't thumbnail
+  basket: new Map(loadJSON("basket", []).map((b) => [b.path, b])), // path -> { path, name, dir, size }
+  basketPaths: loadJSON("basketPaths", true), // keep folder paths in the basket ZIP
+  basketBytes: null,       // { bytes, partial } for the basket's folders
 };
 
 const clientId = getClientId();
@@ -331,7 +342,13 @@ const inflight = new Map();    // path -> Promise of entries, shared by all call
 function fetchListing(path) {
   if (inflight.has(path)) return inflight.get(path);
   const req = api("/api/ls?path=" + encodeURIComponent(path))
-    .then((d) => { rememberListing(path, d.entries); return d.entries; })
+    .then((d) => {
+      // Remember whether this folder is inside an archive (for the header).
+      state.arcOf.set(path, d.archive || "");
+      if (d.partial) state.partialArc.add(path); else state.partialArc.delete(path);
+      rememberListing(path, d.entries);
+      return d.entries;
+    })
     .finally(() => inflight.delete(path));
   inflight.set(path, req);
   return req;
@@ -451,8 +468,31 @@ function renderCrumbs() {
   const title = parts.at(-1) || rootName;
   $("#folder-title").textContent = title;
   $("#folder-title").title = title;
+  renderArchiveChip();
   $("#cc-label").textContent = `${title} — ${state.info.name || "Pidgeon"}`;
   document.title = `${title} — ${state.info.name || "Pidgeon"}`;
+}
+
+/** The archive the current folder is inside ("" if none). Until the
+ *  listing says, a path segment with an archive extension is a good guess. */
+function currentArchive() {
+  const known = state.arcOf.get(state.path);
+  if (known !== undefined) return known;
+  const segs = state.path.split("/");
+  const i = segs.findIndex((seg) => ARCHIVE_RE.test(seg));
+  return i > 0 ? segs.slice(0, i + 1).join("/") : "";
+}
+const ARCHIVE_RE = /\.(zip|tar|tgz|tar\.gz)$/i;
+
+/** Shows the "inside an archive" chip in the folder header. */
+function renderArchiveChip() {
+  const arc = currentArchive(), chip = $("#fh-chip");
+  chip.hidden = !arc;
+  if (!arc) return;
+  const name = arc.slice(arc.lastIndexOf("/") + 1);
+  const partial = state.partialArc.has(state.path) ? " · too big to list completely" : "";
+  chip.innerHTML = `<span class="fi t-archive">${icon("i-archive", "")}</span><span>${arc === state.path ? "archive" : "inside " + esc(name)} · read in place${partial}</span>`;
+  chip.title = `Browsing ${arc} without extracting it`;
 }
 
 /** Shows placeholder rows while a folder loads. */
@@ -585,17 +625,40 @@ function rowSub(e) {
   return count ? `${count} · ${fmtAgo(e.mtime)}` : fmtAgo(e.mtime);
 }
 
+/* thumbnails: grid tiles of images show a small server-made thumbnail
+   (/api/thumb); a file the server can't thumbnail keeps its icon */
+
+const THUMB_EXT = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff"]);
+
+/** Whether an entry gets a thumbnail in the grid view. */
+const thumbable = (e, p) => state.layout === "grid" && state.info.thumbs && !e.dir && THUMB_EXT.has(extOf(e.name)) && !state.thumbFail.has(p);
+
+/** The thumbnail width to ask for: the tile size at this screen density,
+ *  rounded up the way the server rounds (multiples of 64). */
+function thumbWidth() {
+  const px = Math.min(512, 120 * Math.min(3, devicePixelRatio || 1));
+  return Math.ceil(px / 64) * 64;
+}
+
+/** The icon cell of a row: a thumbnail for images in the grid, else the icon. */
+function iconHTML(e, p, fi) {
+  if (!thumbable(e, p)) return fi.html;
+  const src = `/api/thumb?path=${encodeURIComponent(p)}&w=${thumbWidth()}&v=${e.mtime}`;
+  return `<span class="fi thumb">${fi.html}<img src="${esc(src)}" alt="" loading="lazy" decoding="async" data-p="${esc(p)}"></span>`;
+}
+
 /** Builds the HTML for row i of the current view. */
 function rowHTML(i) {
   const e = state.view[i];
   const fi = fileIcon(e);
   const p = join(state.path, e.name);
   const sel = state.sel.has(e.name);
+  const inBasket = state.basket.has(p);
   const preview = previewKind(e)
     ? `<a class="icon-btn act-preview" href="/f${esc(encPath(p))}?inline=1" target="_blank" rel="noopener" title="Open Preview" aria-label="Preview ${esc(e.name)}">${icon("i-eye")}</a>` : "";
-  return `<li class="row${e.dir ? " dir" : ""}${sel ? " sel" : ""}${i === state.cursor ? " cursor" : ""}${state.fresh.has(e.name) ? " fresh" : ""}" data-i="${i}" role="option" aria-selected="${sel}">
+  return `<li class="row${e.dir ? " dir" : ""}${e.archive ? " arc" : ""}${thumbable(e, p) ? " has-thumb" : ""}${sel ? " sel" : ""}${inBasket ? " in-basket" : ""}${i === state.cursor ? " cursor" : ""}${state.fresh.has(e.name) ? " fresh" : ""}" data-i="${i}" role="option" aria-selected="${sel}"${e.archive ? ' title="Archive · double-click to look inside"' : ""}>
     <label class="cb"><input type="checkbox" tabindex="-1" ${sel ? "checked" : ""} aria-label="Select ${esc(e.name)}"><span></span></label>
-    <span class="name-cell">${fi.html}<span class="meta"><span class="name">${esc(e.name)}</span><span class="sub">${esc(rowSub(e))}</span></span></span>
+    <span class="name-cell">${iconHTML(e, p, fi)}<span class="meta"><span class="name">${esc(e.name)}</span><span class="sub">${esc(rowSub(e))}</span></span></span>
     <span class="size">${e.dir ? esc(folderSize(e)) : fmtBytes(e.size)}</span>
     <span class="date">${fmtDate(e.mtime)}</span>
     <span class="acts">${preview}<button class="icon-btn act-link" title="Copy Link" aria-label="Copy link">${icon("i-link")}</button><button class="icon-btn act-dl" title="${e.dir ? "Download as ZIP" : "Download"}" aria-label="Download ${esc(e.name)}">${icon("i-download")}</button></span>
@@ -861,9 +924,9 @@ function refreshFolderSize() {
 /* actions                                                            */
 /* ------------------------------------------------------------------ */
 
-/** Opens a folder or downloads a file. */
+/** Opens a folder (or looks inside an archive) or downloads a file. */
 function openEntry(e) {
-  if (e.dir) go(join(state.path, e.name));
+  if (e.dir || e.archive) go(join(state.path, e.name));
   else downloadFile(e);
 }
 
@@ -893,7 +956,7 @@ function curlFor(e) {
 function startDownload({ name, url, kind, total, entry }) {
   const id = `${clientId}.${++state.seq}`;
   const sep = url.includes("?") ? "&" : "?";
-  state.downloads.set(id, { id, name, kind, total, entry, sent: 0, rate: 0, state: "queued", added: Date.now() });
+  state.downloads.set(id, { id, name, url, kind, total, entry, sent: 0, rate: 0, state: "queued", added: Date.now() });
 
   // A temporary <a download> triggers a normal download without leaving the
   // page; the server's Content-Disposition makes it a save, not a view.
@@ -918,7 +981,7 @@ async function downloadZip(names) {
     const r = await api("/api/zip", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ base: state.path, paths: names, store: state.zipStore }),
+      body: JSON.stringify({ base: state.path, paths: names, store: state.zipStore, sums: state.zipSums }),
     });
     // Stored archives have an exact size: a real progress bar, and resumable.
     startDownload({ name: r.name, url: r.url, kind: "zip", total: r.size >= 0 ? r.size : -1, entry: { name: r.name } });
@@ -951,6 +1014,10 @@ function ensureEvents() {
       if (it.total >= 0) d.total = it.total;
       d.rate = it.rate;
       d.state = it.state === "active" ? "active" : it.state === "done" ? "done" : "failed";
+      // The host can pause or cap a download; a file can change mid-way.
+      d.paused = !!it.paused;
+      d.limit = it.limit || 0;
+      d.changed = !!it.changed;
     }
     renderDownloads();
   };
@@ -1022,6 +1089,9 @@ function renderDownloads() {
         if (d.kind === "upload" && state.info.ask && !d.rate && d.sent < d.total && Date.now() - d.lastProgress > 1500) {
           info = "waiting for the host to accept…";
           prog = `<div class="prog queued"><i></i></div>`;
+        } else if (d.paused) {
+          info = `<span class="warn">⏸ paused by the host</span>${d.total > 0 ? ` · ${pct.toFixed(0)}% · ${fmtBytes(d.sent)}/${fmtBytes(d.total)}` : ` · ${fmtBytes(d.sent)}`}`;
+          prog = `<div class="prog paused"><i style="width:${d.total > 0 ? pct.toFixed(1) : 100}%"></i></div>`;
         } else if (d.total > 0) {
           const eta = d.rate > 0 ? fmtDur((d.total - d.sent) / d.rate) : "";
           info = `${pct.toFixed(0)}% · ${fmtBytes(d.sent)}/${fmtBytes(d.total)} · ${fmtBytes(d.rate)}/s${eta ? " · " + eta : ""}`;
@@ -1030,10 +1100,17 @@ function renderDownloads() {
           info = `${fmtBytes(d.sent)} · ${fmtBytes(d.rate)}/s · zip`;
           prog = `<div class="prog ind"><i></i></div>`;
         }
+        // Say when the host's speed limit is what sets the pace.
+        if (d.limit && !d.paused) info += ` · <span class="muted">capped at ${fmtBytes(d.limit)}/s</span>`;
         break;
       case "done":
         info = d.kind === "upload" ? `<span class="ok">✓</span> sent · saved as ${esc(d.savedAs || d.name)}` : `<span class="ok">✓</span> ${fmtBytes(d.sent)}`;
         prog = `<div class="prog done"><i></i></div>`;
+        // The file was being written while it downloaded: this copy may be torn.
+        if (d.changed) {
+          info = `<span class="warn">⚠ file changed during download</span>${d.url ? ` · <button class="link-btn dl-retry">download again</button>` : ""}`;
+          prog = `<div class="prog changed"><i></i></div>`;
+        }
         break;
       default:
         info = d.error ? `<span class="bad">✕ ${esc(d.error)}</span>` : `<span class="bad">✕ interrupted</span> at ${fmtBytes(d.sent)}`;
@@ -1053,6 +1130,7 @@ function renderDownloads() {
 function togglePanel(force) {
   const p = $("#panel");
   const show = force ?? p.hidden;
+  if (show && !$("#basket").hidden) $("#basket").hidden = true;
   p.hidden = !show;
   $("#dl-btn").classList.toggle("active", show);
 }
@@ -1118,6 +1196,12 @@ function commands() {
     { label: "View: Grid", run: () => setLayout("grid") },
     { label: "Downloads: Clear Finished", run: clearFinished },
     { label: `ZIP: ${state.zipStore ? "Compress Again (smaller, no resume)" : "Always Store (exact size, resumable)"}`, run: toggleZipStore },
+    { label: `ZIP: ${state.zipSums ? "Leave Out SHA256SUMS" : "Include SHA256SUMS"}`, run: toggleZipSums },
+    { label: "Basket: Add or Remove Selection", key: "⇧B", run: () => toggleBasket() },
+    { label: "Basket: Show", desc: state.basket.size ? `${state.basket.size} item(s)` : "empty", run: () => toggleBasketPanel(true) },
+    { label: "Basket: Download as ZIP", desc: state.basket.size ? basketSize() : "empty", run: downloadBasket },
+    { label: "Basket: Empty", run: clearBasket },
+    { label: "File: Show SHA-256…", run: () => { const e = state.view[state.cursor]; e && !e.dir ? showHash(e) : note("Put the cursor on a file first"); } },
     { label: "Open Preview", key: "⇧Space", run: () => { const e = state.view[state.cursor]; e && previewKind(e) ? openPreview(e) : note("Nothing to preview here"); } },
     { label: "Share This Folder…", run: () => openShareDialog({ name: state.path === "/" ? state.info.root || "Files" : state.path.slice(state.path.lastIndexOf("/") + 1), dir: true }, state.path) },
     ...(state.info.inbox ? [{ label: "Send Files to This Computer…", run: pickUploads }] : []),
@@ -1306,17 +1390,23 @@ function showContextMenu(ev, i) {
   if (!state.sel.has(e.name)) { selectRange(i, i); selectionChanged(); }
   setCursor(i);
   const many = state.sel.size > 1;
+  const targets = targetEntries();
+  const inBasket = targets.every((x) => state.basket.has(join(state.path, x.name)));
+  const basket = { label: inBasket ? (many ? `Remove ${targets.length} Items from Basket` : "Remove from Basket") : (many ? `Add ${targets.length} Items to Basket` : "Add to Basket"), key: "⇧B", run: () => toggleBasket(targets) };
   const items = many
-    ? [{ label: `Download ${state.sel.size} Items as ZIP`, run: downloadSelection }]
+    ? [{ label: `Download ${state.sel.size} Items as ZIP`, run: downloadSelection }, basket]
     : e.dir
-      ? [{ label: "Open", run: () => openEntry(e) }, { label: "Download as ZIP", run: () => downloadZip([e.name]) }, "-",
+      ? [{ label: "Open", run: () => openEntry(e) }, { label: "Download as ZIP", run: () => downloadZip([e.name]) }, basket, "-",
         { label: "Copy Link", run: () => copyText(entryURL(e), "link") }, { label: "Create Share Link…", run: () => openShareDialog(e, join(state.path, e.name)) }]
       : [
+        ...(e.archive ? [{ label: "Look Inside", key: "Enter", run: () => openEntry(e) }] : []),
         { label: "Download", run: () => downloadFile(e) },
         ...(previewKind(e) ? [{ label: "Open Preview", key: "⇧Space", run: () => openPreview(e) }] : []),
+        basket,
         "-",
         { label: "Copy Link", run: () => copyText(entryURL(e), "link") },
         { label: "Copy as cURL", run: () => copyText(curlFor(e), "curl command") },
+        { label: "Show SHA-256…", run: () => showHash(e) },
         { label: "Create Share Link…", run: () => openShareDialog(e, join(state.path, e.name)) },
       ];
   items.push("-", { label: "Select All", key: `${MOD}A`, run: () => { selectRange(0, state.view.length - 1); selectionChanged(); } });
@@ -1758,8 +1848,175 @@ function sendUpload(d, f) {
 }
 
 /* ------------------------------------------------------------------ */
+/* basket                                                             */
+/* ------------------------------------------------------------------ */
+
+/* The basket collects files and folders from anywhere in the tree (even
+   from inside archives) and downloads them as one ZIP. It is kept in
+   localStorage, so it survives reloads and moving between folders. */
+
+/** The entries a basket action applies to: the selection, else the cursor row. */
+function targetEntries() {
+  if (state.sel.size) return [...state.sel.values()];
+  const e = state.view[state.cursor];
+  return e ? [e] : [];
+}
+
+/** Adds entries to the basket, or removes them if they are all in it already. */
+function toggleBasket(entries = targetEntries()) {
+  if (!entries.length) return note("Nothing selected");
+  const items = entries.map((e) => ({ path: join(state.path, e.name), name: e.name, dir: !!e.dir, size: e.dir ? 0 : e.size }));
+  const allIn = items.every((it) => state.basket.has(it.path));
+  // Either take them all out, or put the missing ones in.
+  for (const it of items) allIn ? state.basket.delete(it.path) : state.basket.set(it.path, it);
+  basketChanged();
+  const what = items.length === 1 ? items[0].name : `${items.length} items`;
+  note(allIn ? `Removed ${what} from the basket` : `Added ${what} to the basket · ${state.basket.size} in total`, "ok");
+}
+
+/** Saves the basket and refreshes everything that shows it. */
+function basketChanged() {
+  saveJSON("basket", [...state.basket.values()]);
+  state.basketBytes = null;
+  refreshBasketSize();
+  renderBasket();
+  // Drawn rows show a marker for what's in the basket.
+  for (const row of document.querySelectorAll("#list .row[data-i]")) {
+    const e = state.view[+row.dataset.i];
+    if (e) row.classList.toggle("in-basket", state.basket.has(join(state.path, e.name)));
+  }
+}
+
+/** Asks the server for the total size of the basket's folders (debounced). */
+let basketTimer = 0, basketToken = 0;
+function refreshBasketSize() {
+  clearTimeout(basketTimer);
+  const folders = [...state.basket.values()].filter((b) => b.dir);
+  if (!folders.length) return;
+  const token = ++basketToken;
+  basketTimer = setTimeout(async () => {
+    const q = new URLSearchParams({ base: "/" });
+    folders.forEach((f) => q.append("p", f.path.slice(1)));
+    try {
+      const r = await api("/api/size?" + q);
+      if (token === basketToken) { state.basketBytes = r; renderBasket(); }
+    } catch {}
+  }, 300);
+}
+
+/** The basket's total size as text ("≥ 2.3 GB" while folders are partial). */
+function basketSize() {
+  const items = [...state.basket.values()];
+  const files = items.reduce((n, b) => n + (b.dir ? 0 : b.size || 0), 0);
+  if (!items.some((b) => b.dir)) return fmtBytes(files);
+  const fb = state.basketBytes;
+  return fb ? (fb.partial ? "≥ " : "") + fmtBytes(files + fb.bytes) : fmtBytes(files) + " + folders…";
+}
+
+/** Renders the status-bar chip and, when open, the basket popover. */
+function renderBasket() {
+  const n = state.basket.size;
+  const chip = $("#sb-basket");
+  chip.hidden = n === 0;
+  $("#sb-basket-text").textContent = `${n} · ${basketSize()}`;
+  if (!n && !$("#basket").hidden) toggleBasketPanel(false);
+  $("#bk-meta").textContent = n ? `${n} item${n === 1 ? "" : "s"} · ${basketSize()}` : "";
+  $("#bk-paths").checked = state.basketPaths;
+  $("#bk-list").innerHTML = [...state.basket.values()].map((b) => `<li class="bk" data-p="${esc(b.path)}">
+      ${fileIcon(b).html}
+      <span class="bk-name" title="${esc(b.path)}">${esc(b.name)}</span>
+      <span class="bk-where">${esc(parentOf(b.path) === "/" ? state.info.root || "/" : parentOf(b.path).slice(1))}${b.dir ? "" : " · " + fmtBytes(b.size)}</span>
+      <button class="icon-btn bk-x" title="Remove from basket" aria-label="Remove ${esc(b.name)} from basket">${icon("i-x")}</button>
+    </li>`).join("");
+}
+
+/** Shows/hides the basket popover (it shares the downloads popover's spot). */
+function toggleBasketPanel(force) {
+  const p = $("#basket");
+  const show = force ?? p.hidden;
+  if (show) togglePanel(false);
+  p.hidden = !show;
+  if (show) renderBasket();
+}
+
+/** Downloads the basket as one ZIP. A missing item is dropped and reported. */
+async function downloadBasket() {
+  const items = [...state.basket.values()];
+  if (!items.length) return note("The basket is empty");
+  const name = `${state.info.root || "Pidgeon"} basket`;
+  try {
+    const r = await api("/api/zip", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ base: "/", paths: items.map((b) => b.path.slice(1)), store: state.zipStore, sums: state.zipSums, flat: !state.basketPaths, name }),
+    });
+    startDownload({ name: r.name, url: r.url, kind: "zip", total: r.size >= 0 ? r.size : -1, entry: { name: r.name } });
+    toggleBasketPanel(false);
+  } catch (err) {
+    const gone = /^not found: (.*)$/.exec(err.message);
+    // Files can disappear after they were added: drop them and say so.
+    if (gone && state.basket.has(gone[1])) {
+      state.basket.delete(gone[1]);
+      basketChanged();
+      return note(`${gone[1]} is no longer there, so it was taken out of the basket. Try again.`, "err");
+    }
+    note("Couldn't start the ZIP: " + err.message, "err");
+  }
+}
+
+/** Empties the basket. */
+function clearBasket() {
+  state.basket.clear();
+  basketChanged();
+  note("Basket emptied");
+}
+
+/* ------------------------------------------------------------------ */
+/* checksums                                                          */
+/* ------------------------------------------------------------------ */
+
+/** Shows a file's SHA-256 (computed by the server) in a dialog, with a box
+ *  to paste the expected hash into and compare. */
+async function showHash(e, path = join(state.path, e.name)) {
+  const box = $("#dialog-box");
+  box.innerHTML = `<h2>${icon("i-hash")}SHA-256</h2><p class="dlg-sub"><b>${esc(e.name)}</b> · ${fmtBytes(e.size)}</p>
+    <div class="hash-out" id="hash-out"><span class="pv-loading">Reading the file on the server…</span></div>
+    <div class="dlg-actions"><button class="btn secondary" id="hash-close">Close</button></div>`;
+  $("#dialog").hidden = false;
+  $("#hash-close").onclick = closeDialog;
+  $("#hash-close").focus();
+  let r;
+  try {
+    r = await api("/api/hash?path=" + encodeURIComponent(path));
+  } catch (err) {
+    if (!$("#dialog").hidden) $("#hash-out").innerHTML = `<span class="bad">Couldn't hash this file: ${esc(err.message)}</span>`;
+    return;
+  }
+  // The dialog may have been closed (or reused) while the server was reading.
+  if ($("#dialog").hidden || !$("#hash-out")) return;
+  $("#hash-out").innerHTML = `<div class="dlg-link"><input id="hash-val" readonly value="${r.sha256}"><button class="btn primary" id="hash-copy">Copy</button></div>
+    <label class="dlg-row hash-cmp">Compare with<input id="hash-cmp" type="text" spellcheck="false" autocomplete="off" placeholder="paste the expected hash"></label>
+    <p class="dlg-note" id="hash-verdict"></p>`;
+  $("#hash-val").select();
+  $("#hash-copy").onclick = () => copyText(r.sha256, "SHA-256");
+  $("#hash-cmp").oninput = (ev) => {
+    const v = ev.target.value.trim().toLowerCase();
+    const out = $("#hash-verdict");
+    out.className = "dlg-note" + (v ? (v === r.sha256 ? " ok" : " bad") : "");
+    out.textContent = !v ? "" : v === r.sha256 ? "✓ Match: the file is exactly what you expected." : "✕ No match: this isn't the file you expected (or it was damaged).";
+  };
+}
+
+/* ------------------------------------------------------------------ */
 /* misc                                                               */
 /* ------------------------------------------------------------------ */
+
+/** Flips adding SHA256SUMS to ZIPs. */
+function toggleZipSums() {
+  state.zipSums = !state.zipSums;
+  saveJSON("zipSums", state.zipSums);
+  note(state.zipSums ? "ZIPs now include SHA256SUMS (check with: sha256sum -c SHA256SUMS)" : "ZIPs no longer include SHA256SUMS");
+}
 
 /** Flips "always store" for ZIPs (bigger, but exact size and resumable). */
 function toggleZipStore() {
@@ -1871,7 +2128,8 @@ function wire() {
     // While something is selected on a phone, taps extend the selection.
     if (touch && state.sel.size) { setSelected(i, !state.sel.has(e.name)); selectionChanged(); return; }
     if (e.dir) { go(join(state.path, e.name)); return; }
-    if (touch) { downloadFile(e); return; }
+    // On a phone a tap on an archive looks inside; its download button downloads it.
+    if (touch) { openEntry(e); return; }
     selectRange(i, i);
     selectionChanged();
   });
@@ -1879,8 +2137,20 @@ function wire() {
     const row = ev.target.closest(".row");
     if (!row || ev.target.closest(".cb, .acts")) return;
     const e = state.view[+row.dataset.i];
-    if (e && !e.dir) downloadFile(e);
+    if (e && !e.dir) openEntry(e);
   });
+  // A thumbnail the server can't make falls back to the file's icon, and
+  // isn't asked for again.
+  list.addEventListener("error", (ev) => {
+    const img = ev.target;
+    if (img.tagName !== "IMG" || !img.closest(".thumb")) return;
+    state.thumbFail.add(img.dataset.p);
+    img.closest(".row")?.classList.remove("has-thumb");
+    img.remove();
+  }, true);
+  list.addEventListener("load", (ev) => {
+    if (ev.target.tagName === "IMG") ev.target.closest(".thumb")?.classList.add("loaded");
+  }, true);
   list.addEventListener("contextmenu", (ev) => {
     const row = ev.target.closest(".row");
     if (row && !row.classList.contains("skel")) showContextMenu(ev, +row.dataset.i);
@@ -1932,6 +2202,7 @@ function wire() {
         if (state.sel.size > 1) downloadSelection(); else openEntry(state.view[state.cursor]);
         break;
       case "Backspace": ev.preventDefault(); go(parentOf(state.path)); break;
+      case "B": if (ev.shiftKey && !mod) { ev.preventDefault(); toggleBasket(); } break;
       case "a": if (mod) { ev.preventDefault(); selectRange(0, n - 1); selectionChanged(); } break;
       case "Escape": if (state.sel.size) { ev.preventDefault(); clearSelection(); } break;
       case "ContextMenu": {
@@ -1970,6 +2241,7 @@ function wire() {
   });
 
   $("#sel-clear").addEventListener("click", clearSelection);
+  $("#sel-basket").addEventListener("click", () => toggleBasket());
   $("#sel-download").addEventListener("click", downloadSelection);
   $("#refresh").addEventListener("click", () => load(state.path, { force: true }));
   $("#layout-btn").addEventListener("click", toggleLayout);
@@ -1982,12 +2254,35 @@ function wire() {
   $("#dl-clear").addEventListener("click", clearFinished);
   $("#dl-list").addEventListener("click", (ev) => {
     const li = ev.target.closest(".dl");
+    // "download again" after the file changed mid-download.
+    if (li && ev.target.closest(".dl-retry")) {
+      const d = state.downloads.get(li.dataset.id);
+      if (d) { d.state = "dismissed"; startDownload({ name: d.name, url: d.url, kind: d.kind, total: d.kind === "zip" ? -1 : d.total, entry: d.entry }); }
+      return;
+    }
     if (li && ev.target.closest(".dl-x")) {
       const d = state.downloads.get(li.dataset.id);
       if (d) d.state = "dismissed";
       renderDownloads();
       maybeCloseEvents();
     }
+  });
+
+  // Basket popover.
+  $("#sb-basket").addEventListener("click", () => toggleBasketPanel());
+  $("#bk-close").addEventListener("click", () => toggleBasketPanel(false));
+  $("#bk-clear").addEventListener("click", clearBasket);
+  $("#bk-download").addEventListener("click", downloadBasket);
+  $("#bk-paths").addEventListener("change", (ev) => { state.basketPaths = ev.target.checked; saveJSON("basketPaths", state.basketPaths); });
+  $("#bk-list").addEventListener("click", (ev) => {
+    const li = ev.target.closest(".bk");
+    if (!li) return;
+    // The × removes; the name jumps to where the item lives.
+    if (ev.target.closest(".bk-x")) { state.basket.delete(li.dataset.p); basketChanged(); return; }
+    const b = state.basket.get(li.dataset.p);
+    if (!b) return;
+    toggleBasketPanel(false);
+    if (b.dir) go(b.path); else { state.reveal = b.name; go(parentOf(b.path)); }
   });
 
   $("#theme-btn").addEventListener("click", toggleTheme);
@@ -2029,7 +2324,7 @@ function wire() {
     else if (ev.key === "F1") { ev.preventDefault(); openPalette(">"); }
     else if (mod && k === "b" && !ev.shiftKey) { ev.preventDefault(); toggleSidebar(); }
     else if (mod && k === "j" && !ev.shiftKey) { ev.preventDefault(); togglePanel(); }
-    else if (ev.key === "Escape") { closeContextMenu(); closeDrawer(); }
+    else if (ev.key === "Escape") { closeContextMenu(); closeDrawer(); if (!$("#basket").hidden) toggleBasketPanel(false); }
   });
 
   makeSash($("#sash"), "--sidebar-w", { axis: "x", min: 170, max: 520 });
@@ -2083,6 +2378,8 @@ async function main() {
   setLayout(state.layout);
   wire();
   renderDownloads();
+  renderBasket();
+  refreshBasketSize();
   ensureEvents();
   load(pathFromHash());
   try {
@@ -2096,6 +2393,9 @@ async function main() {
       ? "Nothing yet. Click a file to download it, or drop files anywhere to send them to this computer."
       : $("#dl-empty").textContent;
     renderLimits();
+    renderBasket();
+    // The grid was drawn before the server said whether it makes thumbnails.
+    if (state.info.thumbs && state.layout === "grid") renderWindow(true);
   } catch {}
 }
 

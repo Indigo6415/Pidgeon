@@ -40,7 +40,7 @@ func newTestServer(t *testing.T, mut func(*Config)) (*Server, *stats.Store) {
 	_ = os.Symlink(filepath.Dir(dir), filepath.Join(dir, "outside"))
 
 	st := stats.New()
-	cfg := Config{Dir: dir, Store: st, Assets: fstest.MapFS{"index.html": {Data: []byte("<title>{{NAME}}</title>")}}}
+	cfg := Config{Dir: dir, Store: st, ThumbDir: t.TempDir(), Assets: fstest.MapFS{"index.html": {Data: []byte("<title>{{NAME}}</title>")}}}
 	if mut != nil {
 		mut(&cfg)
 	}

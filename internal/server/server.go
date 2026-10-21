@@ -27,10 +27,11 @@ import (
 
 // Config configures a Server.
 type Config struct {
-	Dir        string // directory to serve (made absolute by New)
-	ShowHidden bool   // serve dotfiles and dot-directories
-	Token      string // optional access token (query / cookie / bearer)
-	BasicUser  string // optional HTTP basic auth user
+	Dir        string   // directory to serve (made absolute by New)
+	Paths      []string // several directories and files to serve side by side; overrides Dir
+	ShowHidden bool     // serve dotfiles and dot-directories
+	Token      string   // optional access token (query / cookie / bearer)
+	BasicUser  string   // optional HTTP basic auth user
 	BasicPass  string
 	Store      *stats.Store
 	Assets     fs.FS // web UI assets (index.html, app.js, app.css, ...)
@@ -48,15 +49,18 @@ type Config struct {
 	// BaseURL returns a URL other devices can reach this server on (no
 	// trailing slash), used to build share links. Optional.
 	BaseURL func() string
+
+	NoThumbs bool   // don't generate image thumbnails for the grid view
+	ThumbDir string // where thumbnails are cached; "" picks the user cache dir
 }
 
 // Server is the http.Handler shared by every listener.
 type Server struct {
 	cfg     Config
-	root    *os.Root // all file access goes through this: no path escapes
-	fsys    fs.FS    // root.FS(), used for directory walks
-	name    string   // display name of the served directory
-	index   []byte   // index.html with the product name filled in
+	root    *tree  // all file access goes through this: no path escapes
+	fsys    fs.FS  // root.FS(), used for directory walks
+	name    string // display name of the served directory (or directories)
+	index   []byte // index.html with the product name filled in
 	handler http.Handler
 
 	zipMu     sync.Mutex
@@ -74,6 +78,13 @@ type Server struct {
 	hubMu sync.Mutex
 	subs  map[*subscriber]struct{} // open event streams
 
+	arcMu       sync.Mutex
+	arcs        map[string]*arcIndex // archive tables of contents, by root-relative path
+	arcBuilding map[string]*arcBuild // archives being indexed right now
+
+	thumbs *thumbCache // nil when thumbnails are off
+	hashes *hashCache
+
 	done      chan struct{} // closed by Close to end long-lived SSE streams
 	closeOnce sync.Once
 }
@@ -82,26 +93,36 @@ type Server struct {
 // reported to clients as a plain 404 so hidden names aren't confirmed.
 var errHidden = errors.New("hidden path")
 
-// New opens the served directory and builds the handler.
+// New opens the served directory (or directories) and builds the handler.
 func New(cfg Config) (*Server, error) {
-	abs, err := filepath.Abs(cfg.Dir)
+	paths := cfg.Paths
+	if len(paths) == 0 {
+		paths = []string{cfg.Dir}
+	}
+	abs := make([]string, len(paths))
+	// Every served path is made absolute up front.
+	for i, p := range paths {
+		a, err := filepath.Abs(p)
+		if err != nil {
+			return nil, err
+		}
+		abs[i] = a
+	}
+	cfg.Paths, cfg.Dir = abs, abs[0]
+	root, err := openTree(abs)
 	if err != nil {
 		return nil, err
 	}
-	cfg.Dir = abs
-	root, err := os.OpenRoot(abs)
-	if err != nil {
-		return nil, fmt.Errorf("cannot serve %s: %w", abs, err)
-	}
 	idx, err := fs.ReadFile(cfg.Assets, "index.html")
 	if err != nil {
+		root.Close()
 		return nil, fmt.Errorf("web assets missing index.html: %w", err)
 	}
 	s := &Server{
 		cfg:  cfg,
 		root: root,
 		fsys: root.FS(),
-		name: filepath.Base(abs),
+		name: treeName(root),
 		index: []byte(strings.NewReplacer(
 			"{{NAME}}", html.EscapeString(brand.Name),
 			"{{TAGLINE}}", html.EscapeString(brand.Tagline),
@@ -113,6 +134,13 @@ func New(cfg Config) (*Server, error) {
 		uploading: map[string]bool{},
 		subs:      map[*subscriber]struct{}{},
 		done:      make(chan struct{}),
+
+		arcs:        map[string]*arcIndex{},
+		arcBuilding: map[string]*arcBuild{},
+		hashes:      newHashCache(),
+	}
+	if !cfg.NoThumbs {
+		s.thumbs = newThumbCache(cfg.ThumbDir)
 	}
 	if cfg.Inbox != "" {
 		if err := s.openInbox(cfg.Inbox); err != nil {
@@ -138,6 +166,8 @@ func New(cfg Config) (*Server, error) {
 	mux.HandleFunc("GET /s/{id}", s.handleShare)
 	mux.HandleFunc("GET /s/{id}/{rest...}", s.handleShare)
 	mux.HandleFunc("PUT /api/upload", s.handleUpload)
+	mux.HandleFunc("GET /api/thumb", s.handleThumb)
+	mux.HandleFunc("GET /api/hash", s.handleHash)
 
 	// Order matters: instrument is outermost so rejected (401) requests are
 	// still counted and logged; the device gate sits inside auth so only
@@ -150,8 +180,29 @@ func New(cfg Config) (*Server, error) {
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.handler.ServeHTTP(w, r) }
 
-// Dir returns the absolute directory being served.
+// Dir returns the absolute directory being served (the first one, when
+// several paths are served).
 func (s *Server) Dir() string { return s.cfg.Dir }
+
+// Paths returns every absolute path being served, in order.
+func (s *Server) Paths() []string { return s.root.Paths() }
+
+// treeName is the display name of what is served: the folder's name, or
+// for several paths the first two names and how many more there are.
+func treeName(t *tree) string {
+	if !t.multi() {
+		return filepath.Base(t.single.Name())
+	}
+	names := make([]string, 0, 2)
+	// Name the first two; count the rest.
+	for i, m := range t.mounts {
+		if i == 2 {
+			return strings.Join(names, " + ") + fmt.Sprintf(" +%d", len(t.mounts)-2)
+		}
+		names = append(names, m.name)
+	}
+	return strings.Join(names, " + ")
+}
 
 // Inbox returns the absolute upload directory, or "" when uploads are off.
 func (s *Server) Inbox() string { return s.cfg.Inbox }
@@ -268,9 +319,17 @@ func (s *Server) resolve(p string) (string, error) {
 	if name == "" {
 		return ".", nil
 	}
-	// Refuse dotfile segments unless explicitly allowed.
-	if !s.cfg.ShowHidden && hasHiddenSegment(name) {
-		return "", errHidden
+	// Refuse dotfile segments unless explicitly allowed. The top-level
+	// names of a multi-root tree were chosen on the command line, so they
+	// are never hidden.
+	if !s.cfg.ShowHidden {
+		check := name
+		if top, rest, _ := strings.Cut(name, "/"); s.root.isMount(top) {
+			check = rest
+		}
+		if hasHiddenSegment(check) {
+			return "", errHidden
+		}
 	}
 	if !fs.ValidPath(name) {
 		return "", fs.ErrInvalid
@@ -292,6 +351,13 @@ func hasHiddenSegment(name string) bool {
 // isHiddenName reports whether a single entry name is a dotfile.
 func isHiddenName(n string) bool { return strings.HasPrefix(n, ".") }
 
+// hidden reports whether entry n of root-relative folder dir is left out
+// of listings: dotfiles are, unless --hidden, except for the top-level
+// names of a multi-root tree.
+func (s *Server) hidden(dir, n string) bool {
+	return !s.cfg.ShowHidden && isHiddenName(n) && !(dir == "." && s.root.isMount(n))
+}
+
 // clientIP extracts the remote IP without the port (and without the IPv6
 // "::ffff:" mapping prefix).
 func clientIP(r *http.Request) string {
@@ -305,12 +371,14 @@ func clientIP(r *http.Request) string {
 // httpError maps filesystem errors onto status codes without leaking paths.
 func httpError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, errHidden), errors.Is(err, fs.ErrNotExist):
+	case errors.Is(err, errHidden), errors.Is(err, fs.ErrNotExist), errors.Is(err, errNotDir):
 		http.Error(w, "not found", http.StatusNotFound)
 	case errors.Is(err, fs.ErrPermission):
 		http.Error(w, "forbidden", http.StatusForbidden)
 	case errors.Is(err, fs.ErrInvalid):
 		http.Error(w, "bad path", http.StatusBadRequest)
+	case errors.Is(err, errNotArchive):
+		http.Error(w, "this archive can't be read", http.StatusUnprocessableEntity)
 	default:
 		// os.Root reports escapes ("path escapes from parent") as a plain
 		// error; treat anything unexpected as not found.

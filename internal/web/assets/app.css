@@ -309,6 +309,23 @@ kbd { font: 11px var(--mono); }
 }
 /* without hover, the checkboxes must always be there to tap */
 @media (hover: none) { .table.grid .row .cb { opacity: 1; } }
+/* image tiles: a thumbnail fades in over the icon once it has loaded */
+.table.grid .row.has-thumb { padding-top: 8px; }
+.table.grid .row.has-thumb .name { -webkit-line-clamp: 1; }
+.table.grid .row.has-thumb .sub { display: none; }
+.table.grid .row .fi.thumb { position: relative; width: 100%; height: 76px; }
+.fi.thumb img {
+  position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; border-radius: 4px;
+  opacity: 0; transition: opacity .2s;
+}
+.fi.thumb.loaded img { opacity: 1; }
+.fi.thumb.loaded > svg { visibility: hidden; }
+
+/* in the basket: a small dot after the name */
+.row.in-basket .name::after {
+  content: ""; display: inline-block; width: 6px; height: 6px; margin-left: 6px; border-radius: 50%;
+  background: var(--c-orange); vertical-align: middle;
+}
 
 /* checkbox */
 .cb { position: relative; display: grid; place-items: center; width: 34px; height: 100%; cursor: pointer; }
@@ -387,6 +404,46 @@ kbd { font: 11px var(--mono); }
 .prog.queued > i { width: 100%; opacity: .4; animation: pulse 1.2s ease-in-out infinite; }
 .prog.done > i { width: 100%; background: var(--ok); opacity: .6; }
 .prog.failed > i { width: 100%; background: var(--err); opacity: .6; }
+.prog.paused > i { background: var(--warn); transition: none; }
+.prog.changed > i { width: 100%; background: var(--warn); opacity: .6; }
+.dl .warn { color: var(--warn); } .dl .muted { color: var(--fg-faint); }
+.link-btn { color: var(--link); text-decoration: underline; font: inherit; }
+
+/* ---------- basket ---------- */
+
+.bk {
+  display: grid; grid-template-columns: 18px minmax(0, 1fr) 22px; column-gap: 10px; row-gap: 2px;
+  align-items: center; padding: 6px 6px 6px 10px; border-radius: 6px; font-size: 12.5px; cursor: pointer;
+}
+.bk:hover { background: var(--bg-hover); }
+.bk .fi { grid-row: span 2; }
+.bk .bk-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
+.bk .bk-where { grid-column: 2; font: 11px var(--mono); color: var(--fg-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bk .bk-x { grid-column: 3; grid-row: 1 / span 2; visibility: hidden; }
+.bk:hover .bk-x { visibility: visible; }
+.bk-foot { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-top: 1px solid var(--border); flex: none; }
+.bk-opt { display: flex; align-items: center; gap: 6px; color: var(--fg-muted); font-size: 12px; cursor: pointer; }
+#sb-basket .i { color: var(--c-orange); }
+
+/* ---------- inside an archive ---------- */
+
+.fh-chip {
+  display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; padding: 2px 9px 2px 6px; border-radius: 10px;
+  font-size: 11.5px; color: var(--fg-muted); background: color-mix(in srgb, var(--c-orange) 13%, transparent);
+}
+.fh-chip .fi { --cut: var(--bg); width: 14px; height: 14px; }
+.fh-chip .fi svg { width: 14px; height: 14px; }
+
+/* ---------- checksum dialog ---------- */
+
+.hash-out { margin-top: 4px; }
+.hash-out .bad { color: var(--err); }
+.hash-cmp { margin-top: 14px; }
+.hash-cmp input {
+  flex: 1; min-width: 0; height: 28px; padding: 0 8px; font: 12px var(--mono); color: var(--fg);
+  background: var(--bg-input); border: 1px solid var(--border-input); border-radius: 6px;
+}
+.dlg-note.ok { color: var(--ok); } .dlg-note.bad { color: var(--err); }
 
 /* ---------- status line ---------- */
 
@@ -634,6 +691,8 @@ button.sb-item:hover { background: var(--bg-hover); color: var(--fg); }
   }
   .dl { padding: 10px 8px 10px 12px; }
   .dl .dl-x { visibility: visible; }
+  .bk { padding: 10px 8px 10px 12px; }
+  .bk .bk-x { visibility: visible; }
   /* the selection already shows in the folder header; keep the status line short */
   #sb-sel { display: none; }
   .notifications { left: 12px; right: 12px; width: auto; bottom: 40px; }

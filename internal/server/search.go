@@ -83,7 +83,7 @@ walk:
 				break walk
 			}
 			n := de.Name()
-			if !s.cfg.ShowHidden && isHiddenName(n) {
+			if s.hidden(dir, n) {
 				continue
 			}
 			rel := n

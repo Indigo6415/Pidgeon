@@ -5,6 +5,8 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
@@ -190,6 +192,9 @@ func (d *dashboard) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	case key.Matches(msg, k.Share):
 		return d.startShare()
 
+	case key.Matches(msg, k.Pause):
+		return d.togglePause()
+
 	case key.Matches(msg, k.Cancel):
 		if d.focus != focusTransfers {
 			d.say("move down to a transfer first, then press enter to cancel it", true)
@@ -285,6 +290,7 @@ func (d *dashboard) mainMenu() *menu {
 			menuItem{label: "Send a file to a device…", hint: "pops up in its browser", run: d.startSend},
 		)
 	}
+	items = append(items, menuItem{label: "Bandwidth limits…", hint: d.limitsHint(), run: func() tea.Cmd { d.menu = d.bandwidthMenu(); return nil }})
 	return newMenu(brand.Name, append(items, quit)...)
 }
 
@@ -303,22 +309,13 @@ func (d *dashboard) rowMenu() *menu {
 		}
 		return nil
 	}
-	// Transfer row: the only action is cancelling it.
+	// Transfer row: pause, limit or cancel it.
 	if d.focus == focusTransfers {
 		i := d.selectedIndex()
 		if i < 0 {
 			return nil
 		}
-		t := d.snap.Transfers[i]
-		hint := "the download fails on " + t.Client
-		if t.Kind == stats.KindUpload {
-			hint = "the upload from " + t.Client + " is discarded"
-		}
-		cancel := menuItem{label: "Cancel transfer", hint: hint, danger: true, run: d.cancelSelected}
-		if t.State != stats.StateActive {
-			cancel.disabled, cancel.hint = true, "already finished"
-		}
-		return newMenu(t.Name, cancel, back)
+		return d.transferMenu(d.snap.Transfers[i])
 	}
 	if len(d.lis) == 0 {
 		return nil
@@ -679,7 +676,7 @@ func (d *dashboard) header(w int) string {
 	}
 	leftPart := fgs(th.accent).Bold(true).Render("⬡ "+strings.ToUpper(brand.Name)) +
 		fgs(th.muted).Render(" "+brand.ResolvedVersion()) + "  " + status + "  " +
-		fgs(th.fg).Render(tildePath(d.o.Dir))
+		fgs(th.fg).Render(d.servedLabel())
 	auth := d.o.AuthMode
 	if d.o.Devices != nil && d.o.Devices.Ask() {
 		auth += " + ask"
@@ -694,6 +691,35 @@ func (d *dashboard) header(w int) string {
 		return fit(" "+leftPart, w)
 	}
 	return " " + leftPart + strings.Repeat(" ", max(0, gap-1)) + right
+}
+
+// servedLabel names what is served: the folder, or for several paths how
+// many there are and their names.
+func (d *dashboard) servedLabel() string {
+	if len(d.o.Roots) < 2 {
+		return tildePath(d.o.Dir)
+	}
+	names := make([]string, len(d.o.Roots))
+	// Base names keep the header short; the banner has the full paths.
+	for i, r := range d.o.Roots {
+		names[i] = path.Base(filepath.ToSlash(r))
+	}
+	return fmt.Sprintf("%d roots: %s", len(names), strings.Join(names, ", "))
+}
+
+// limitsHint summarises the speed caps for the main menu.
+func (d *dashboard) limitsHint() string {
+	var parts []string
+	if v := d.snap.Limit; v > 0 {
+		parts = append(parts, humanize.Rate(float64(v))+" total")
+	}
+	if v := d.snap.ClientLimit; v > 0 {
+		parts = append(parts, humanize.Rate(float64(v))+" per device")
+	}
+	if len(parts) == 0 {
+		return "none set"
+	}
+	return strings.Join(parts, ", ")
 }
 
 // limitsBadge shows how close the session is to ending by itself: the time
@@ -801,7 +827,7 @@ func (d *dashboard) throughputPanel(w, sparkRows int) string {
 	th := d.th
 	s := d.snap
 	inner := w - 4
-	rows := sparkline(s.History, inner, sparkRows, th)
+	rows := sparkline(s.History, inner, sparkRows, th, float64(s.Limit))
 
 	avg := 0.0
 	for _, v := range s.History {
@@ -830,13 +856,19 @@ func (d *dashboard) throughputPanel(w, sparkRows int) string {
 		hot = in + m.Render(" · ") + hot
 	}
 	rows = append(rows, hot)
-	return th.panel("Throughput · last 60s", rows, w, false)
+	title := "Throughput · last 60s"
+	if s.Limit > 0 {
+		title += " · capped at " + humanize.Rate(float64(s.Limit))
+	}
+	return th.panel(title, rows, w, false)
 }
 
 // sparkline renders history as a multi-row bar chart using eighth blocks,
 // stretched to fill the width (each column shows the sample under it); when
 // the panel is narrower than the history, only the latest seconds are shown.
-func sparkline(hist []float64, width, rows int, th theme) []string {
+// A speed cap (capV > 0) is drawn as a dashed line at its height, and the
+// scale always leaves room for it.
+func sparkline(hist []float64, width, rows int, th theme, capV float64) []string {
 	bars := []rune(" ▁▂▃▄▅▆▇█")
 	vals := hist
 	if len(vals) > width {
@@ -845,6 +877,12 @@ func sparkline(hist []float64, width, rows int, th theme) []string {
 	peak := 0.0
 	for _, v := range vals {
 		peak = max(peak, v)
+	}
+	// The cap's row: the scale stretches so the line stays on the chart.
+	capRow := -1
+	if capV > 0 {
+		peak = max(peak, capV*1.15)
+		capRow = rows - 1 - min(rows-1, max(0, int(capV/peak*float64(rows*8))-1)/8)
 	}
 	colors := lipgloss.Blend1D(max(2, len(vals)), th.accent2, th.accent)
 	out := make([]string, rows)
@@ -869,6 +907,10 @@ func sparkline(hist []float64, width, rows int, th theme) []string {
 			// Idle baseline: a faint rule on the bottom row keeps the axis visible.
 			if fill == 0 && level == 0 {
 				cell, col = "·", th.line
+			}
+			// The cap line shows wherever no bar covers it.
+			if r == capRow && fill < 8 && c%2 == 0 {
+				cell, col = "╌", th.warn
 			}
 			sb.WriteString(fgs(col).Render(cell))
 		}
@@ -944,6 +986,9 @@ func (d *dashboard) transfersPanel(w, maxRows int) string {
 		if t.Share != "" {
 			name += " (link)"
 		}
+		if t.Limit > 0 && !finished {
+			name += " (≤" + humanize.Rate(float64(t.Limit)) + ")"
+		}
 		// ↑ leaves this machine, ↓ arrives in the inbox.
 		dir := fgs(th.accent).Render("↑ ")
 		if t.Kind == stats.KindUpload {
@@ -980,6 +1025,21 @@ func countUploads(ts []stats.View) int {
 // unknown sizes, or the final state.
 func (d *dashboard) progressCell(t stats.View, w int) string {
 	th := d.th
+	switch {
+	case t.Changed && t.State != stats.StateAborted:
+		// The file changed on disk mid-transfer: the copy may be inconsistent.
+		label := "⚠ file changed"
+		if t.State == stats.StateActive {
+			label = "⚠ changing"
+		}
+		return fgs(th.warn).Render(padRight(label, w))
+	case t.Paused && t.State == stats.StateActive:
+		pct := ""
+		if p := t.Progress(); p >= 0 {
+			pct = fmt.Sprintf(" %3.0f%%", p*100)
+		}
+		return fgs(th.warn).Render(padRight("⏸ paused"+pct, w))
+	}
 	switch t.State {
 	case stats.StateDone:
 		return fgs(lerp(th.ok, th.bg, 0.3)).Render(padRight("✓ done", w))

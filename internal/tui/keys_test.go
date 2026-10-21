@@ -69,14 +69,23 @@ func TestArrowsEnterEscReachEverything(t *testing.T) {
 		t.Fatal("esc should close the actions menu")
 	}
 
-	// ↓ past the last listener lands on the transfer; enter → enter cancels it.
+	// ↓ past the last listener lands on the transfer; its menu starts with
+	// pause (enter → enter pauses, again resumes), then limit, then cancel.
 	press(d, tea.KeyDown, tea.KeyDown)
 	if d.focus != focusTransfers || d.tsel != tr.ID {
 		t.Fatalf("↓ should flow into transfers (focus=%v sel=%d)", d.focus, d.tsel)
 	}
 	press(d, tea.KeyEnter, tea.KeyEnter)
+	if !d.snap.Transfers[0].Paused {
+		t.Fatal("enter, enter on a transfer should pause it")
+	}
+	press(d, tea.KeyEnter, tea.KeyEnter)
+	if d.snap.Transfers[0].Paused {
+		t.Fatal("enter, enter on a paused transfer should resume it")
+	}
+	press(d, tea.KeyEnter, tea.KeyDown, tea.KeyDown, tea.KeyEnter)
 	if !tr.Cancelled() {
-		t.Fatal("enter, enter on a transfer should cancel it")
+		t.Fatal("enter, ↓, ↓, enter on a transfer should cancel it")
 	}
 
 	// ↑ climbs back into the listeners panel.
@@ -85,7 +94,7 @@ func TestArrowsEnterEscReachEverything(t *testing.T) {
 		t.Fatalf("↑ should return to the last listener (focus=%v cur=%d)", d.focus, d.lcur)
 	}
 
-	// esc opens the main menu: "all keys" is item 2, quit is item 3.
+	// esc opens the main menu: "all keys" is item 2, bandwidth item 3, quit item 4.
 	press(d, tea.KeyEscape, tea.KeyDown, tea.KeyEnter)
 	if !d.help.ShowAll {
 		t.Fatal("main menu should toggle the full key list")
@@ -94,7 +103,7 @@ func TestArrowsEnterEscReachEverything(t *testing.T) {
 	if d.help.ShowAll || d.menu != nil {
 		t.Fatal("esc should first collapse the key list")
 	}
-	if !isQuit(press(d, tea.KeyEscape, tea.KeyDown, tea.KeyDown, tea.KeyEnter)) {
+	if !isQuit(press(d, tea.KeyEscape, tea.KeyDown, tea.KeyDown, tea.KeyDown, tea.KeyEnter)) {
 		t.Fatal("esc → quit → enter should quit")
 	}
 
