@@ -610,7 +610,7 @@ button.sb-item:hover { background: var(--bg-hover); color: var(--fg); }
 .dlg-sub { margin: 0 0 16px; color: var(--fg-muted); }
 .dlg-sub b { color: var(--fg); }
 .dlg-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
-.dlg-row select, .dlg-link input {
+.dlg-row select, .dlg-row input, .dlg-link input {
   height: 28px; padding: 0 8px; font: inherit; color: var(--fg); background: var(--bg-input);
   border: 1px solid var(--border-input); border-radius: 6px;
 }
@@ -618,6 +618,48 @@ button.sb-item:hover { background: var(--bg-hover); color: var(--fg); }
 .dlg-link input { flex: 1; min-width: 0; font: 12px var(--mono); }
 .dlg-note { margin: 12px 0 0; color: var(--fg-faint); font-size: 12px; }
 .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.dlg-row input { width: 150px; }
+#rq-folder { width: 210px; }
+.dlg-hint { margin-left: auto; color: var(--fg-faint); font-size: 11.5px; }
+.dlg-note b { color: var(--fg); font-weight: 600; }
+
+/* ---------- received files, Pigeon Post, nearby servers ---------- */
+
+.got { display: inline-flex; vertical-align: -2px; margin-left: 6px; color: var(--ok); }
+.got .i { width: 13px; height: 13px; stroke-width: 2; }
+.post-list { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; }
+.msg { display: flex; flex-direction: column; max-width: 85%; }
+.msg.mine { align-self: flex-end; align-items: flex-end; }
+.msg.host { align-self: flex-start; }
+.bubble { padding: 7px 11px; border-radius: 12px; background: var(--bg-input); color: var(--fg-strong); white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg.mine .bubble { background: var(--accent); color: var(--accent-fg); }
+.msg.mine .bubble a { color: inherit; text-decoration: underline; }
+.msg-meta { margin-top: 2px; color: var(--fg-faint); font-size: 11px; }
+.msg-meta .link-btn { margin-left: 6px; }
+.post-empty { margin: auto 0; padding: 18px 8px; color: var(--fg-muted); text-align: center; }
+.post-form { display: flex; gap: 8px; align-items: flex-end; padding: 8px 10px; border-top: 1px solid var(--border); flex: none; }
+.post-form textarea {
+  flex: 1; min-width: 0; resize: none; max-height: 120px; padding: 6px 8px; font: inherit; color: var(--fg);
+  background: var(--bg-input); border: 1px solid var(--border-input); border-radius: 6px;
+}
+.post-form textarea:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
+.nearby { flex: none; max-height: 34%; display: flex; flex-direction: column; border-top: 1px solid var(--border); }
+.nearby-list { list-style: none; margin: 0; padding: 2px 0 4px; overflow: auto; }
+.nearby-list .tnode { color: var(--fg); text-decoration: none; padding-left: 8px; gap: 7px; }
+.nearby-list .tnode span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nearby-list ul { margin: 0; padding: 0; list-style: none; }
+.nearby-list:hover .tnode .guide { background: color-mix(in srgb, var(--fg-faint) 35%, transparent); }
+.ic-peer, .nearby-list .ic-peer { color: var(--link); }
+.nb-lock { margin-left: auto; padding-right: 6px; font-size: 11px; }
+/* a server in the flock asking for its token, in place of the listing */
+.flock-login { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 14px; }
+.flock-login input {
+  width: 220px; max-width: 100%; padding: 5px 8px; font: inherit; color: var(--fg);
+  background: var(--bg-input); border: 1px solid var(--border-input); border-radius: 4px;
+}
+.flock-login input:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
+.flock-login .btn { margin-top: 0; }
+.flock-err { min-height: 1.4em; margin: 8px 0 0; color: var(--err); }
 
 /* ---------- drop zone and notes from the host ---------- */
 

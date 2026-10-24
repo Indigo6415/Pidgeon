@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"crypto/rand"
 	"fmt"
 	"path"
 	"slices"
@@ -123,7 +124,8 @@ func (d *dashboard) deviceMenu(dev devices.Device) *menu {
 	if d.online[ip] == 0 {
 		send.disabled, send.hint = true, "no page open on it"
 	}
-	items = append(items, send)
+	items = append(items, send,
+		menuItem{label: "Send text…", hint: "Pigeon Post", run: func() tea.Cmd { return d.composePost(ip) }})
 	if dev.Status != devices.Allowed {
 		items = append(items, menuItem{label: "Allow", run: func() tea.Cmd { reg.Allow(ip, false); d.say("allowed "+dev.Label(), false); return nil }})
 	}
@@ -288,6 +290,17 @@ func (d *dashboard) sharesPanel(w, maxRows int) string {
 		if sh.MaxUses > 0 {
 			uses = fmt.Sprintf("%d/%d used", sh.Uses, sh.MaxUses)
 		}
+		// A file request collects files instead of handing them out.
+		if sh.Request {
+			name = "⇣ " + name
+			uses = fmt.Sprintf("%d in", sh.Uses)
+			if sh.MaxUses > 0 {
+				uses = fmt.Sprintf("%d/%d in", sh.Uses, sh.MaxUses)
+			}
+		}
+		if sh.PIN != "" {
+			name += " · PIN"
+		}
 		var st string
 		switch {
 		case sh.State != "active":
@@ -318,8 +331,18 @@ func (d *dashboard) shareMenu(sh server.Share) *menu {
 		cp.disabled, op.disabled, revoke.disabled = true, true, true
 		revoke.hint = sh.State
 	}
-	m := newMenu("Share link · "+sh.Path, cp, op, revoke, remove, menuItem{label: "Back", run: func() tea.Cmd { return nil }})
+	title := "Share link · " + sh.Path
+	if sh.Request {
+		title = "File request · " + sh.Name
+	}
+	m := newMenu(title, cp, op, revoke, remove, menuItem{label: "Back", run: func() tea.Cmd { return nil }})
 	m.note = []string{sh.URL}
+	if sh.PIN != "" {
+		m.note = append(m.note, "PIN "+sh.PIN)
+	}
+	if sh.Request {
+		m.note = append(m.note, fmt.Sprintf("Files land in %s (%d so far).", sh.Path, sh.Uses))
+	}
 	return m
 }
 
@@ -331,44 +354,138 @@ func (d *dashboard) startShare() tea.Cmd {
 	return d.browse("/", pickShare, "")
 }
 
-// shareExpiry asks how long the new link to p should last.
-func (d *dashboard) shareExpiry(p string) tea.Cmd {
+// startRequest begins a file request: a link others upload files with,
+// into a folder of the inbox. First the folder's name.
+func (d *dashboard) startRequest() tea.Cmd {
+	if d.o.Server == nil || d.o.Server.Inbox() == "" {
+		d.say("file requests need an inbox: start with --inbox <dir>", true)
+		return nil
+	}
+	def := "Request " + time.Now().Format("2006-01-02 1504")
+	note := []string{"Name the inbox folder the files go into.", "Leave it empty for “" + def + "”."}
+	return d.openInput("Request files", note, def, 120, func(name string) tea.Cmd {
+		return d.shareExpiry(server.ShareOptions{Request: true, Folder: strings.TrimSpace(name)})
+	})
+}
+
+// shareSubject describes the link being made, for the menus' notes.
+func shareSubject(o server.ShareOptions) string {
+	if o.Request {
+		name := o.Folder
+		if name == "" {
+			name = "a new folder"
+		}
+		return "Requesting files into " + name
+	}
+	return "Sharing " + o.Path
+}
+
+// shareExpiry asks how long the new link should last.
+func (d *dashboard) shareExpiry(o server.ShareOptions) tea.Cmd {
 	opt := func(label string, ttl time.Duration) menuItem {
-		return menuItem{label: label, run: func() tea.Cmd { return d.shareUses(p, ttl) }}
+		return menuItem{label: label, run: func() tea.Cmd { o.TTL = ttl; return d.shareUses(o) }}
 	}
 	m := newMenu("Link expires",
 		opt("in 15 minutes", 15*time.Minute), opt("in 1 hour", time.Hour), opt("in 1 day", 24*time.Hour),
 		opt("in 7 days", 7*24*time.Hour), opt("never (while "+brand.Name+" runs)", 0),
 	)
 	m.cur = 1 // an hour is a sensible default
-	m.note = []string{"Sharing " + p}
+	m.note = []string{shareSubject(o)}
 	d.menu = m
 	return nil
 }
 
-// shareUses asks how many downloads the new link allows, then creates it.
-func (d *dashboard) shareUses(p string, ttl time.Duration) tea.Cmd {
+// shareUses asks how many downloads (or, for a request, files) the new
+// link allows.
+func (d *dashboard) shareUses(o server.ShareOptions) tea.Cmd {
 	opt := func(label string, n int) menuItem {
-		return menuItem{label: label, run: func() tea.Cmd { return d.createShare(p, ttl, n) }}
+		return menuItem{label: label, run: func() tea.Cmd { o.MaxUses = n; return d.sharePIN(o) }}
 	}
-	m := newMenu("Downloads allowed", opt("1 download", 1), opt("3 downloads", 3), opt("10 downloads", 10), opt("unlimited", 0))
-	m.note = []string{"Sharing " + p, "Resuming a started download doesn't count."}
+	var m *menu
+	if o.Request {
+		m = newMenu("Files accepted", opt("1 file", 1), opt("10 files", 10), opt("100 files", 100), opt("unlimited", 0))
+		m.cur = 3
+		m.note = []string{shareSubject(o), "Copies of files already in the inbox don't count."}
+	} else {
+		m = newMenu("Downloads allowed", opt("1 download", 1), opt("3 downloads", 3), opt("10 downloads", 10), opt("unlimited", 0))
+		m.note = []string{shareSubject(o), "Resuming a started download doesn't count."}
+	}
 	d.menu = m
 	return nil
+}
+
+// sharePIN asks whether visitors must type a PIN first, then makes the link.
+func (d *dashboard) sharePIN(o server.ShareOptions) tea.Cmd {
+	with := func(pin string) tea.Cmd { o.PIN = pin; return d.createShare(o) }
+	m := newMenu("PIN",
+		menuItem{label: "No PIN", hint: "the link alone is enough", run: func() tea.Cmd { return with("") }},
+		menuItem{label: "Random 4-digit PIN", run: func() tea.Cmd { return with(randomPIN(4)) }},
+		menuItem{label: "Random 6-digit PIN", run: func() tea.Cmd { return with(randomPIN(6)) }},
+		menuItem{label: "Choose a PIN…", run: func() tea.Cmd { return d.choosePIN(o) }},
+	)
+	m.note = []string{shareSubject(o), "Tell the PIN separately (say it, text it): whoever", "intercepts the link alone still can't open it."}
+	d.menu = m
+	return nil
+}
+
+// choosePIN asks for a PIN of the operator's choice.
+func (d *dashboard) choosePIN(o server.ShareOptions) tea.Cmd {
+	return d.openInput("Choose a PIN", []string{"4 to 12 digits."}, "e.g. 2468", 12, func(pin string) tea.Cmd {
+		pin = strings.TrimSpace(pin)
+		if !validPIN(pin) {
+			d.say("a PIN is 4 to 12 digits", true)
+			return d.choosePIN(o)
+		}
+		o.PIN = pin
+		return d.createShare(o)
+	})
+}
+
+// validPIN reports whether p is 4 to 12 digits.
+func validPIN(p string) bool {
+	if len(p) < 4 || len(p) > 12 {
+		return false
+	}
+	for _, c := range p {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// randomPIN makes an n-digit PIN.
+func randomPIN(n int) string {
+	b := make([]byte, n)
+	rand.Read(b)
+	// Map each byte to a digit; the slight bias doesn't matter for a PIN
+	// that locks after ten wrong guesses.
+	for i := range b {
+		b[i] = '0' + b[i]%10
+	}
+	return string(b)
 }
 
 // createShare makes the link, selects it (so the QR code shows it) and
 // copies it to the clipboard.
-func (d *dashboard) createShare(p string, ttl time.Duration, uses int) tea.Cmd {
-	sh, err := d.o.Server.CreateShare(p, ttl, uses)
+func (d *dashboard) createShare(o server.ShareOptions) tea.Cmd {
+	sh, err := d.o.Server.NewShare(o)
 	if err != nil {
-		d.say("couldn't share "+p+": "+err.Error(), true)
+		d.say("couldn't make the link: "+err.Error(), true)
 		return nil
 	}
 	d.ssel = sh.ID
 	d.focus = focusShares
 	d.refresh()
-	d.say("share link copied — scan the QR code or paste it: "+sh.URL, false)
+	what := "share link"
+	if sh.Request {
+		what = "file request"
+	}
+	msg := what + " copied — scan the QR code or paste it: " + sh.URL
+	if sh.PIN != "" {
+		msg = what + " copied (PIN " + sh.PIN + ") — " + sh.URL
+	}
+	d.say(msg, false)
 	return tea.SetClipboard(sh.URL)
 }
 
@@ -451,7 +568,7 @@ func (d *dashboard) browse(dir string, mode pickMode, ip string) tea.Cmd {
 	parent := path.Dir(dir)
 	var items []menuItem
 	if mode == pickShare {
-		items = append(items, menuItem{label: "★ Share this folder", hint: dir, run: func() tea.Cmd { return d.shareExpiry(dir) }})
+		items = append(items, menuItem{label: "★ Share this folder", hint: dir, run: func() tea.Cmd { return d.shareExpiry(server.ShareOptions{Path: dir}) }})
 	}
 	if dir != "/" {
 		items = append(items, menuItem{label: "../", hint: "up", run: func() tea.Cmd { return d.browse(parent, mode, ip) }})
@@ -469,7 +586,7 @@ func (d *dashboard) browse(dir string, mode pickMode, ip string) tea.Cmd {
 		}
 		it := menuItem{label: e.Name, hint: humanize.Bytes(e.Size)}
 		if mode == pickShare {
-			it.run = func() tea.Cmd { return d.shareExpiry(p) }
+			it.run = func() tea.Cmd { return d.shareExpiry(server.ShareOptions{Path: p}) }
 		} else {
 			it.run = func() tea.Cmd { return d.sendTo(ip, p) }
 		}
@@ -509,8 +626,14 @@ func (d *dashboard) qrTarget() (u, note string) {
 		if i := d.shareIndex(); i >= 0 && d.shares[i].State == "active" {
 			sh := d.shares[i]
 			note = "share link · " + path.Base(sh.Path)
+			if sh.Request {
+				note = "file request · " + sh.Name
+			}
 			if sh.MaxUses > 0 {
 				note += fmt.Sprintf(" · %d left", sh.MaxUses-sh.Uses)
+			}
+			if sh.PIN != "" {
+				note += " · PIN " + sh.PIN
 			}
 			return sh.URL, note
 		}

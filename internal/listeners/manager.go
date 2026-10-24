@@ -2,6 +2,7 @@ package listeners
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -35,6 +36,15 @@ type Info struct {
 	Covered bool   // enabled, but served through the wildcard listener
 	Err     string // last bind error, if any
 	Conns   int    // open TCP connections attributed to this address
+	TLS     bool   // served over HTTPS
+}
+
+// Scheme is "https" when the server uses TLS, else "http".
+func (i Info) Scheme() string {
+	if i.TLS {
+		return "https"
+	}
+	return "http"
 }
 
 // Serving reports whether the address is reachable right now.
@@ -45,7 +55,7 @@ func (i Info) URL() string {
 	if i.Port == 0 {
 		return ""
 	}
-	return "http://" + i.Host() + ":" + strconv.Itoa(i.Port) + "/"
+	return i.Scheme() + "://" + i.Host() + ":" + strconv.Itoa(i.Port) + "/"
 }
 
 // ReachableURL picks the address other devices are most likely to reach,
@@ -90,7 +100,7 @@ func ReachableURL(infos []Info) string {
 	if !pick.Bound && wildPort > 0 {
 		port = wildPort
 	}
-	return "http://" + pick.Host() + ":" + strconv.Itoa(port)
+	return pick.Scheme() + "://" + pick.Host() + ":" + strconv.Itoa(port)
 }
 
 // listener is the mutable per-address state. All fields are guarded by
@@ -121,6 +131,7 @@ type Manager struct {
 	conns    map[string]int            // open conns keyed by resolved listener ID
 	draining map[*http.Server]struct{} // disabled servers finishing in-flight work
 	closed   bool
+	tls      *tls.Config // set: every listener serves HTTPS
 
 	// baseCtx is the parent of every request context. It is cancelled only on
 	// a forced shutdown, which aborts whatever is still running.
@@ -149,6 +160,13 @@ func NewManager(cands []Candidate, handler http.Handler, port int, hooks ConnHoo
 		m.byID[c.ID] = l
 	}
 	return m
+}
+
+// SetTLS makes every listener serve HTTPS with cfg. Call it before Start.
+func (m *Manager) SetTLS(cfg *tls.Config) {
+	m.mu.Lock()
+	m.tls = cfg
+	m.mu.Unlock()
 }
 
 // AddCustom registers an address that discovery didn't find (from --bind).
@@ -339,6 +357,7 @@ func (m *Manager) List() []Info {
 			Covered:   covered,
 			Err:       l.err,
 			Conns:     m.conns[l.cand.ID],
+			TLS:       m.tls != nil,
 		})
 	}
 	return out
@@ -468,6 +487,12 @@ func (m *Manager) serveLocked(l *listener, ln net.Listener) {
 	l.srv = srv
 	l.ln = ln
 	l.drain = drain
+	// HTTPS: the certificate comes from the config, not from files.
+	if m.tls != nil {
+		srv.TLSConfig = m.tls.Clone()
+		go srv.ServeTLS(ln, "", "")
+		return
+	}
 	go srv.Serve(ln)
 }
 

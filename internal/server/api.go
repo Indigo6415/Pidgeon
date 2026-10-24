@@ -26,11 +26,15 @@ type entry struct {
 	Link  bool   `json:"link,omitempty"`
 	// Archive marks a .zip / .tar / .tar.gz file that can be browsed like a folder.
 	Archive bool `json:"archive,omitempty"`
+	// Got is when the asking device received this version of the file in
+	// full (Unix ms), from its delivery receipts; 0 = it hasn't.
+	Got int64 `json:"got,omitempty"`
 }
 
 // listing is the /api/ls response.
 type listing struct {
-	Path    string  `json:"path"` // "/" or "/a/b"
+	Name    string  `json:"name,omitempty"` // the folder's name (share links only)
+	Path    string  `json:"path"`           // "/" or "/a/b"
 	Entries []entry `json:"entries"`
 	Archive string  `json:"archive,omitempty"` // the archive this folder is inside, "/a/b.zip"
 	Partial bool    `json:"partial,omitempty"` // the archive was too big to index completely
@@ -86,6 +90,19 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	if s.thumbs != nil {
 		info["thumbs"] = true
 	}
+	if s.cfg.InboxSort != "" && s.inbox != nil {
+		info["inboxSort"] = s.cfg.InboxSort
+	}
+	if s.cfg.TV {
+		info["tv"] = s.TVName()
+	}
+	if s.cfg.Nearby != nil {
+		info["nearby"] = true
+		// Nearby servers open in place, as folders of the flock.
+		if s.cfg.Flock && r.Header.Get(flockHeader) == "" {
+			info["flock"] = true
+		}
+	}
 	// Several roots: the top level is a virtual folder of them.
 	if s.root.multi() {
 		info["roots"] = len(s.root.mounts)
@@ -95,9 +112,14 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 
 // handleList returns the entries of one directory.
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
-	name, err := s.resolve(r.URL.Query().Get("path"))
+	name, err := s.resolveIn(r, r.URL.Query().Get("path"))
 	if err != nil {
 		httpError(w, err)
+		return
+	}
+	// A folder on another server is listed by that server.
+	if id, inner, ok := splitFlock(name); ok {
+		s.flockListing(w, r, name, id, inner)
 		return
 	}
 	entries, err := s.list(name)
@@ -105,6 +127,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		httpError(w, err)
 		return
 	}
+	s.markReceived(r, name, entries)
 	out := listing{Path: "/", Entries: entries}
 	if name != "." {
 		out.Path = "/" + name
@@ -223,18 +246,31 @@ func (s *Server) handlePeek(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	out := map[string]peekInfo{}
+	remote := map[string]map[string]string{} // peer ID -> folder on it -> the p it was asked as
 	// Summarise each requested folder until the count or time budget runs out.
 	for i, p := range q["p"] {
 		if i >= peekMaxFolders || ctx.Err() != nil {
 			break
 		}
-		name, err := s.resolve(path.Join("/", q.Get("base"), p))
+		name, err := s.resolveIn(r, path.Join("/", q.Get("base"), p))
 		if err != nil {
+			continue
+		}
+		// Folders on other servers are asked about together, below.
+		if id, inner, ok := splitFlock(name); ok {
+			if remote[id] == nil {
+				remote[id] = map[string]string{}
+			}
+			remote[id][inner] = p
 			continue
 		}
 		if info, ok := s.peek(name); ok {
 			out[p] = info
 		}
+	}
+	// One request per peer, for all of its folders.
+	for id, want := range remote {
+		s.flockPeek(ctx, r, id, want, out)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -313,10 +349,16 @@ func (s *Server) handleSize(w http.ResponseWriter, r *http.Request) {
 	var total, files int64
 	partial := false
 	seen := 0
+	remote := map[string][]string{} // peer ID -> paths on it
 	// Walk each requested path; stop early on the time / entry budget.
 	for _, p := range q["p"] {
-		name, err := s.resolve(path.Join("/", q.Get("base"), p))
+		name, err := s.resolveIn(r, path.Join("/", q.Get("base"), p))
 		if err != nil {
+			continue
+		}
+		// Paths on other servers are totalled there, below.
+		if id, inner, ok := splitFlock(name); ok {
+			remote[id] = append(remote[id], inner)
 			continue
 		}
 		// Inside an archive the index already has every size.
@@ -351,6 +393,11 @@ func (s *Server) handleSize(w http.ResponseWriter, r *http.Request) {
 			}
 			return nil
 		})
+	}
+	// One request per peer, for all of its paths.
+	for id, inners := range remote {
+		b, n, part, _ := s.flockSize(ctx, r, id, inners)
+		total, files, partial = total+b, files+n, partial || part
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"bytes": total, "files": files, "partial": partial})
 }

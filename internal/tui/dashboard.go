@@ -19,6 +19,7 @@ import (
 	"charm.land/lipgloss/v2"
 
 	"github.com/Indigo6415/pidgeon/internal/brand"
+	"github.com/Indigo6415/pidgeon/internal/certs"
 	"github.com/Indigo6415/pidgeon/internal/devices"
 	"github.com/Indigo6415/pidgeon/internal/humanize"
 	"github.com/Indigo6415/pidgeon/internal/listeners"
@@ -75,7 +76,14 @@ type dashboard struct {
 	qrOK   bool
 	qrNote string // what the QR code points at
 
-	menu *menu // open popup menu, if any; it captures all keys
+	menu  *menu  // open popup menu, if any; it captures all keys
+	input *input // open text field, if any; it captures all keys
+
+	posts     []server.Message // Pigeon Post, oldest first
+	postSeen  uint64           // highest message ID already queued
+	postQueue []server.Message // messages from devices not shown yet
+
+	deliveries bool // the bottom panel shows deliveries instead of requests
 }
 
 // newDashboard creates the dashboard and takes a first snapshot.
@@ -107,6 +115,7 @@ func (d *dashboard) refresh() {
 		d.focus = focusListeners
 	}
 	d.syncPrompt()
+	d.syncPosts()
 
 	// Re-encode the QR code only when its target URL changes.
 	u, note := d.qrTarget()
@@ -151,7 +160,10 @@ func (d *dashboard) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	if msg.String() == "ctrl+c" {
 		return tea.Quit
 	}
-	// An open menu captures every key until it closes.
+	// An open text field, then an open menu, capture every key.
+	if d.input != nil {
+		return d.inputKey(msg)
+	}
 	if d.menu != nil {
 		return d.menuKey(msg)
 	}
@@ -191,6 +203,14 @@ func (d *dashboard) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 
 	case key.Matches(msg, k.Share):
 		return d.startShare()
+
+	case key.Matches(msg, k.Post):
+		if d.o.Server != nil {
+			return d.postMainMenu()
+		}
+
+	case key.Matches(msg, k.Deliveries):
+		d.deliveries = !d.deliveries
 
 	case key.Matches(msg, k.Pause):
 		return d.togglePause()
@@ -287,7 +307,15 @@ func (d *dashboard) mainMenu() *menu {
 	if d.o.Server != nil {
 		items = append(items,
 			menuItem{label: "Create a share link…", hint: "one file or folder, no token needed", run: d.startShare},
+		)
+		// File requests land in the inbox, so they need one.
+		if d.o.Server.Inbox() != "" {
+			items = append(items, menuItem{label: "Request files…", hint: "a link others can upload with", run: d.startRequest})
+		}
+		items = append(items,
 			menuItem{label: "Send a file to a device…", hint: "pops up in its browser", run: d.startSend},
+			menuItem{label: "Pigeon Post…", hint: "send or read text messages", key: "m", run: d.postMainMenu},
+			menuItem{label: "Deliveries…", hint: fmt.Sprintf("%d so far", d.o.Store.Deliveries()), run: d.deliveriesMenu},
 		)
 	}
 	items = append(items, menuItem{label: "Bandwidth limits…", hint: d.limitsHint(), run: func() tea.Cmd { d.menu = d.bandwidthMenu(); return nil }})
@@ -531,7 +559,7 @@ func (d *dashboard) shareURL() string {
 			}
 		}
 	}
-	u := "http://" + host + ":" + strconv.Itoa(l.Port) + "/"
+	u := l.Scheme() + "://" + host + ":" + strconv.Itoa(l.Port) + "/"
 	if d.o.Token != "" {
 		u += "?token=" + url.QueryEscape(d.o.Token)
 	}
@@ -571,6 +599,9 @@ func (d *dashboard) view(w, h int) string {
 	// Decide whether the QR column fits next to the left stack.
 	qrW := d.qr.w + 4
 	qrH := len(d.qr.lines) + 5 // code + blank + URL + note + borders
+	if d.o.Fingerprint != "" {
+		qrH++ // the certificate fingerprint
+	}
 	listH := len(d.lis) + 2
 	thruBase := 8
 	showQR := d.qrOK && w >= qrW+1+56 && avail >= qrH+3
@@ -610,8 +641,13 @@ func (d *dashboard) view(w, h int) string {
 		}
 		rows := min(max(1, len(d.snap.Transfers)), tAvail)
 		sections = append(sections, d.transfersPanel(w, rows))
+		// The bottom panel shows requests or deliveries ("d" switches).
 		if logH := remaining - (rows + 2); logH >= 3 {
-			sections = append(sections, d.logPanel(w, logH-2))
+			if d.deliveries {
+				sections = append(sections, d.deliveriesPanel(w, logH-2))
+			} else {
+				sections = append(sections, d.logPanel(w, logH-2))
+			}
 		}
 	}
 	// Fit the body to exactly the rows above the footer: clip so the
@@ -627,8 +663,12 @@ func (d *dashboard) view(w, h int) string {
 		body = append(body, "")
 	}
 	out := strings.Join(append(body, foot...), "\n")
-	// A popup menu floats over the live dashboard, which keeps updating.
-	if d.menu != nil {
+	// A popup menu or text field floats over the live dashboard, which
+	// keeps updating.
+	switch {
+	case d.input != nil:
+		out = overlay(out, d.input.view(d.th), w, h)
+	case d.menu != nil:
 		out = overlay(out, d.menu.view(d.th), w, h)
 	}
 	return out
@@ -680,6 +720,12 @@ func (d *dashboard) header(w int) string {
 	auth := d.o.AuthMode
 	if d.o.Devices != nil && d.o.Devices.Ask() {
 		auth += " + ask"
+	}
+	if d.o.Fingerprint != "" {
+		auth += " · https"
+	}
+	if d.o.TVName != "" {
+		auth += " · tv"
 	}
 	right := fgs(th.muted).Render(fmt.Sprintf("up %s · auth: %s ", humanize.Duration(d.snap.Uptime), auth))
 	if lim := d.limitsBadge(); lim != "" {
@@ -926,7 +972,11 @@ func (d *dashboard) qrPanel(w, h int) string {
 	rows = append(rows, "")
 	u := d.qr.text
 	note := d.qrNote
-	rows = append(rows, fgs(th.accent).Render(strings.TrimPrefix(u, "http://")))
+	rows = append(rows, fgs(th.accent).Render(strings.TrimPrefix(strings.TrimPrefix(u, "http://"), "https://")))
+	// HTTPS: the fingerprint to compare with the browser's warning page.
+	if d.o.Fingerprint != "" {
+		rows = append(rows, fgs(th.faint).Render("SHA-256 "+certs.Pretty(d.o.Fingerprint, 6)))
+	}
 	for len(rows) < h-3 {
 		rows = append(rows, "")
 	}
@@ -1115,7 +1165,7 @@ func (d *dashboard) logPanel(w, n int) string {
 	if len(rows) == 0 {
 		rows = append(rows, fgs(th.faint).Render("Waiting for the first request…"))
 	}
-	return th.panel("Recent requests", rows, w, false)
+	return th.panel("Recent requests · d: deliveries", rows, w, false)
 }
 
 // footer shows key help on the left and any transient message on the right.

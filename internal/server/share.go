@@ -20,11 +20,19 @@ import (
 // is an unguessable ID that works without the access token, can expire and
 // can be limited to a number of downloads, and can be revoked from the
 // dashboard at any time. Links live only as long as the server runs.
+//
+// A link can also ask for a PIN first: the visitor types it once and gets a
+// cookie for that link; ten wrong guesses lock the link for good.
+//
+// A file request is a link the other way round: its page is a drop zone,
+// and what visitors send lands in its own folder of the inbox. Its limit
+// counts files received instead of downloads.
 
 // Bounds for links created over the API.
 const (
-	shareMaxTTL  = 30 * 24 * time.Hour
-	shareMaxUses = 1000
+	shareMaxTTL   = 30 * 24 * time.Hour
+	shareMaxUses  = 1000
+	sharePINTries = 10 // wrong PINs before a link locks
 )
 
 // share is one link. All fields are guarded by Server.shareMu.
@@ -35,14 +43,22 @@ type share struct {
 	created time.Time
 	expires time.Time // zero = never
 	maxUses int       // 0 = unlimited
-	uses    int
+	uses    int       // downloads started, or files received for a request
 	revoked bool
+
+	pin    string // digits the visitor must enter first; "" = none
+	pinKey string // cookie value proving the PIN was entered
+	fails  int    // wrong PIN attempts
+
+	request bool   // a file request: visitors upload instead of download
+	folder  string // request: inbox-relative folder uploads land in
+	pending int    // request: uploads in progress (they hold a use)
 }
 
 // Share is a snapshot of a share link.
 type Share struct {
 	ID      string    `json:"id"`
-	Path    string    `json:"path"` // "/a/b"
+	Path    string    `json:"path"` // "/a/b"; for a request, where uploads land
 	Name    string    `json:"name"`
 	Dir     bool      `json:"dir"`
 	URL     string    `json:"url"`
@@ -51,7 +67,19 @@ type Share struct {
 	MaxUses int       `json:"maxUses"`
 	Uses    int       `json:"uses"`
 	Revoked bool      `json:"revoked"`
-	State   string    `json:"state"` // "active", "expired", "used up" or "revoked"
+	State   string    `json:"state"` // "active", "expired", "used up", "locked" or "revoked"
+	Request bool      `json:"request"`
+	PIN     string    `json:"-"` // shown in the dashboard only
+}
+
+// ShareOptions describe a new share link.
+type ShareOptions struct {
+	Path    string        // file or folder to share ("/a/b"); unused for a request
+	TTL     time.Duration // 0 = until the server stops
+	MaxUses int           // downloads allowed (files, for a request); 0 = unlimited
+	PIN     string        // optional digits the visitor must type first
+	Request bool          // a file request into the inbox instead of a download
+	Folder  string        // request: inbox subfolder for the files; "" picks one
 }
 
 // stateLocked says whether the link still works, and if not, why.
@@ -61,6 +89,8 @@ func (sh *share) stateLocked(now time.Time) string {
 		return "revoked"
 	case !sh.expires.IsZero() && now.After(sh.expires):
 		return "expired"
+	case sh.pin != "" && sh.fails >= sharePINTries:
+		return "locked"
 	case sh.maxUses > 0 && sh.uses >= sh.maxUses:
 		return "used up"
 	}
@@ -71,14 +101,18 @@ func (sh *share) stateLocked(now time.Time) string {
 func (s *Server) snapshotLocked(sh *share, now time.Time) Share {
 	p := "/"
 	name := s.name
-	if sh.path != "." {
+	switch {
+	case sh.request:
+		// A served path ("/Inbox/x") when the inbox is browsable, else "inbox/x".
+		p, name = s.uploadDisplay(sh.folder), sh.folder
+	case sh.path != ".":
 		p = "/" + sh.path
 		name = path.Base(sh.path)
 	}
 	return Share{
 		ID: sh.id, Path: p, Name: name, Dir: sh.dir, URL: s.ShareURL(sh.id),
 		Created: sh.created, Expires: sh.expires, MaxUses: sh.maxUses, Uses: sh.uses,
-		Revoked: sh.revoked, State: sh.stateLocked(now),
+		Revoked: sh.revoked, State: sh.stateLocked(now), Request: sh.request, PIN: sh.pin,
 	}
 }
 
@@ -95,26 +129,73 @@ func (s *Server) ShareURL(id string) string {
 // CreateShare makes a link to p ("/a/b"), valid for ttl (0 = until the
 // server stops) and for maxUses downloads (0 = unlimited).
 func (s *Server) CreateShare(p string, ttl time.Duration, maxUses int) (Share, error) {
-	name, err := s.resolve(p)
-	if err != nil {
-		return Share{}, err
-	}
-	fi, err := s.stat(name)
-	if err != nil {
-		return Share{}, err
-	}
-	if !fi.IsDir() && !fi.Mode().IsRegular() {
-		return Share{}, errors.New("only files and folders can be shared")
+	return s.NewShare(ShareOptions{Path: p, TTL: ttl, MaxUses: maxUses})
+}
+
+// errNoInbox is returned when a file request is made without --inbox.
+var errNoInbox = errors.New("file requests need an inbox (start with --inbox <dir>)")
+
+// NewShare makes a share link or a file request.
+func (s *Server) NewShare(o ShareOptions) (Share, error) {
+	if o.PIN != "" && !validPIN(o.PIN) {
+		return Share{}, errors.New("a PIN is 4 to 12 digits")
 	}
 	now := time.Now()
-	sh := &share{id: randomToken()[:22], path: name, dir: fi.IsDir(), created: now, maxUses: max(0, maxUses)}
-	if ttl > 0 {
-		sh.expires = now.Add(ttl)
+	sh := &share{id: randomToken()[:22], created: now, maxUses: max(0, o.MaxUses), pin: o.PIN, dir: true}
+	if o.PIN != "" {
+		sh.pinKey = randomToken()
+	}
+	if o.TTL > 0 {
+		sh.expires = now.Add(o.TTL)
+	}
+	if o.Request {
+		if s.inbox == nil {
+			return Share{}, errNoInbox
+		}
+		folder := strings.TrimSpace(o.Folder)
+		if folder == "" {
+			folder = "Request " + now.Format("2006-01-02 1504")
+		}
+		folder, err := cleanUploadName(folder)
+		if err != nil {
+			return Share{}, err
+		}
+		if err := s.inbox.MkdirAll(folder, 0o755); err != nil {
+			return Share{}, fmt.Errorf("can't create the folder: %w", err)
+		}
+		sh.request, sh.folder, sh.path = true, folder, "."
+	} else {
+		name, err := s.resolve(o.Path)
+		if err != nil {
+			return Share{}, err
+		}
+		fi, err := s.stat(name)
+		if err != nil {
+			return Share{}, err
+		}
+		if !fi.IsDir() && !fi.Mode().IsRegular() {
+			return Share{}, errors.New("only files and folders can be shared")
+		}
+		sh.path, sh.dir = name, fi.IsDir()
 	}
 	s.shareMu.Lock()
 	defer s.shareMu.Unlock()
 	s.shares[sh.id] = sh
 	return s.snapshotLocked(sh, now), nil
+}
+
+// validPIN reports whether p is 4 to 12 digits.
+func validPIN(p string) bool {
+	if len(p) < 4 || len(p) > 12 {
+		return false
+	}
+	// Digits only: easy to type on a phone keypad.
+	for _, c := range p {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // Shares lists every link, newest first, including dead ones (so the
@@ -151,12 +232,16 @@ func (s *Server) RemoveShare(id string) {
 }
 
 // handleShareCreate makes a link from the web UI:
-// {"path":"/a/b","ttl":3600,"uses":3} (ttl in seconds; 0 = no limit).
+// {"path":"/a/b","ttl":3600,"uses":3,"pin":"1234"} (ttl in seconds; 0 = no
+// limit), or a file request: {"request":true,"folder":"Photos","ttl":...}.
 func (s *Server) handleShareCreate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Path string `json:"path"`
-		TTL  int64  `json:"ttl"`
-		Uses int    `json:"uses"`
+		Path    string `json:"path"`
+		TTL     int64  `json:"ttl"`
+		Uses    int    `json:"uses"`
+		PIN     string `json:"pin"`
+		Request bool   `json:"request"`
+		Folder  string `json:"folder"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -167,8 +252,13 @@ func (s *Server) handleShareCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "expiry or download limit out of range", http.StatusBadRequest)
 		return
 	}
-	sh, err := s.CreateShare(req.Path, ttl, req.Uses)
+	sh, err := s.NewShare(ShareOptions{Path: req.Path, TTL: ttl, MaxUses: req.Uses, PIN: req.PIN, Request: req.Request, Folder: req.Folder})
 	if err != nil {
+		// Validation problems are worth reading; path problems stay vague.
+		if req.Request || req.PIN != "" && !validPIN(req.PIN) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		httpError(w, err)
 		return
 	}
@@ -187,6 +277,7 @@ func (s *Server) handleShareList(w http.ResponseWriter, r *http.Request) {
 }
 
 // shareJSON is a share's wire form; times are Unix milliseconds (0 = none).
+// The PIN itself is never sent, only whether there is one.
 func shareJSON(sh Share) map[string]any {
 	exp := int64(0)
 	if !sh.Expires.IsZero() {
@@ -195,16 +286,21 @@ func shareJSON(sh Share) map[string]any {
 	return map[string]any{
 		"id": sh.ID, "path": sh.Path, "name": sh.Name, "dir": sh.Dir, "url": sh.URL,
 		"expires": exp, "maxUses": sh.MaxUses, "uses": sh.Uses, "state": sh.State,
+		"request": sh.Request, "pin": sh.PIN != "",
 	}
 }
 
-// handleShare serves /s/<id> and, for folder links, /s/<id>/<sub path>.
-// A file link downloads the file. A folder link shows a small page listing
-// the folder (and its subfolders), with a ZIP of any folder via ?zip=1.
-// Every download started counts as a use; resuming one doesn't.
-func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
+// deadMessage explains a link that stopped working.
+var deadMessage = map[string]string{
+	"expired": "This link has expired.", "revoked": "This link has been revoked.",
+	"used up": "This link has been used up.", "locked": "This link is locked after too many wrong PINs.",
+}
+
+// lookupShare finds a live link and checks its PIN, writing the error (or
+// PIN) page itself when the visitor can't go on. resume lets a used-up
+// download link still finish a download that already started.
+func (s *Server) lookupShare(w http.ResponseWriter, r *http.Request, resume bool) (*share, Share, bool) {
 	id := r.PathValue("id")
-	rest := r.PathValue("rest")
 	s.shareMu.Lock()
 	sh, ok := s.shares[id]
 	var snap Share
@@ -214,12 +310,103 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 	s.shareMu.Unlock()
 	if !ok {
 		s.shareError(w, http.StatusNotFound, "This link doesn't exist.", "Ask whoever sent it for a new one.")
+		return nil, snap, false
+	}
+	if snap.State != "active" && !(snap.State == "used up" && resume && !snap.Request) {
+		s.shareError(w, http.StatusGone, deadMessage[snap.State], "Ask whoever sent it for a new one.")
+		return nil, snap, false
+	}
+	if snap.PIN != "" && !s.pinOK(r, sh) {
+		s.pinPage(w, r, snap, false)
+		return nil, snap, false
+	}
+	return sh, snap, true
+}
+
+// pinCookie names the cookie that remembers a link's PIN.
+func pinCookie(id string) string { return brand.CookieName + "_pin_" + id }
+
+// pinOK reports whether the request proves it knows the link's PIN: the
+// cookie set by the PIN page, or an X-Pidgeon-PIN header (for scripts and
+// `pidgeon pull`). A wrong header counts as a wrong guess.
+func (s *Server) pinOK(r *http.Request, sh *share) bool {
+	s.shareMu.Lock()
+	defer s.shareMu.Unlock()
+	if c, err := r.Cookie(pinCookie(sh.id)); err == nil && equal(c.Value, sh.pinKey) {
+		return true
+	}
+	if h := r.Header.Get("X-Pidgeon-PIN"); h != "" {
+		if equal(h, sh.pin) {
+			return true
+		}
+		sh.fails++
+	}
+	return false
+}
+
+// handleSharePIN checks a PIN typed into the PIN page (POST /s/<id>). The
+// right PIN sets a cookie scoped to this link and returns to the page the
+// visitor came from; ten wrong ones lock the link.
+func (s *Server) handleSharePIN(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+	pin, next := r.PostFormValue("pin"), r.PostFormValue("next")
+	s.shareMu.Lock()
+	sh, ok := s.shares[id]
+	var snap Share
+	right := false
+	if ok && sh.pin != "" && sh.stateLocked(time.Now()) == "active" {
+		right = equal(pin, sh.pin)
+		if !right {
+			sh.fails++
+		}
+	}
+	if ok {
+		snap = s.snapshotLocked(sh, time.Now())
+	}
+	s.shareMu.Unlock()
+	switch {
+	case !ok:
+		s.shareError(w, http.StatusNotFound, "This link doesn't exist.", "Ask whoever sent it for a new one.")
+	case snap.State != "active":
+		s.shareError(w, http.StatusGone, deadMessage[snap.State], "Ask whoever sent it for a new one.")
+	case !right:
+		s.pinPage(w, r, snap, true)
+	default:
+		http.SetCookie(w, &http.Cookie{
+			Name: pinCookie(id), Value: sh.pinKey, Path: "/s/" + id,
+			HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: r.TLS != nil,
+		})
+		// Only pages of this link are valid places to return to.
+		if next != "/s/"+id && !strings.HasPrefix(next, "/s/"+id+"/") {
+			next = "/s/" + id
+		}
+		http.Redirect(w, r, next, http.StatusSeeOther)
+	}
+}
+
+// handleShare serves /s/<id> and, for folder links, /s/<id>/<sub path>.
+// A file link downloads the file. A folder link shows a small page listing
+// the folder (and its subfolders), with a ZIP of any folder via ?zip=1. A
+// file request shows its upload page. ?json=1 describes a file or lists a
+// folder for scripts (`pidgeon pull`) instead. Every download started
+// counts as a use; resuming one doesn't.
+func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	rest := r.PathValue("rest")
+	sh, snap, ok := s.lookupShare(w, r, isResume(r))
+	if !ok {
 		return
 	}
-	resume := isResume(r)
-	// A used-up link may still finish a download that already started.
-	if snap.State == "expired" || snap.State == "revoked" || (snap.State == "used up" && !resume) {
-		s.shareError(w, http.StatusGone, "This link has "+map[string]string{"expired": "expired", "revoked": "been revoked", "used up": "been used up"}[snap.State]+".", "Ask whoever sent it for a new one.")
+	asJSON := r.URL.Query().Get("json") == "1"
+
+	// A file request only has its upload page.
+	if snap.Request {
+		if rest != "" {
+			s.shareError(w, http.StatusNotFound, "Not found.", "")
+			return
+		}
+		s.requestPage(w, snap)
 		return
 	}
 
@@ -227,6 +414,10 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 	if !snap.Dir {
 		if rest != "" {
 			s.shareError(w, http.StatusNotFound, "Not found.", "")
+			return
+		}
+		if asJSON {
+			s.shareFileJSON(w, sh.path)
 			return
 		}
 		if !s.useShare(id, r) {
@@ -238,7 +429,7 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// A folder link: pages end in "/" so relative links work.
-	if !strings.HasSuffix(r.URL.Path, "/") && rest == "" {
+	if !strings.HasSuffix(r.URL.Path, "/") && rest == "" && !asJSON {
 		http.Redirect(w, r, "/s/"+id+"/", http.StatusFound)
 		return
 	}
@@ -254,6 +445,20 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case asJSON && !fi.IsDir():
+		s.shareFileJSON(w, name)
+	case asJSON:
+		es, err := s.list(name)
+		if err != nil {
+			http.Error(w, "this folder can't be read", http.StatusNotFound)
+			return
+		}
+		// Paths are relative to the shared folder, which is "/".
+		rel, title := "", snap.Name
+		if name != sh.path {
+			rel, title = relTo(sh.path, name), path.Base(name)
+		}
+		writeJSON(w, http.StatusOK, listing{Name: title, Path: "/" + rel, Entries: es})
 	case !fi.IsDir():
 		if !s.useShare(id, r) {
 			s.shareError(w, http.StatusGone, "This link has been used up.", "Ask whoever sent it for a new one.")
@@ -267,6 +472,61 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 	default:
 		s.shareListing(w, snap, sh.path, name)
 	}
+}
+
+// shareFileJSON describes one shared file without counting a use.
+func (s *Server) shareFileJSON(w http.ResponseWriter, name string) {
+	fi, err := s.stat(name)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"file": true, "name": fi.Name(), "size": fi.Size(), "mtime": fi.ModTime().UnixMilli()})
+}
+
+// handleShareUpload receives one file for a file request:
+// PUT /s/<id>/upload?name=<file name>. Each upload holds one of the link's
+// uses while it runs; a duplicate the inbox already has gives it back.
+func (s *Server) handleShareUpload(w http.ResponseWriter, r *http.Request) {
+	sh, snap, ok := s.lookupShare(w, r, false)
+	if !ok {
+		return
+	}
+	if !snap.Request {
+		http.Error(w, "this link doesn't accept files", http.StatusMethodNotAllowed)
+		return
+	}
+	s.shareMu.Lock()
+	full := sh.maxUses > 0 && sh.uses+sh.pending >= sh.maxUses
+	if !full {
+		sh.pending++
+	}
+	s.shareMu.Unlock()
+	if full {
+		http.Error(w, "this request has all the files it asked for", http.StatusGone)
+		return
+	}
+	res := s.receive(w, r, uploadTarget{dir: sh.folder, share: sh.id})
+	s.shareMu.Lock()
+	sh.pending--
+	if res.ok && !res.duplicate {
+		sh.uses++
+	}
+	s.shareMu.Unlock()
+}
+
+// handleShareCheck is the duplicate pre-check for a file request; it looks
+// only inside the request's own folder.
+func (s *Server) handleShareCheck(w http.ResponseWriter, r *http.Request) {
+	sh, snap, ok := s.lookupShare(w, r, false)
+	if !ok {
+		return
+	}
+	if !snap.Request {
+		http.Error(w, "this link doesn't accept files", http.StatusMethodNotAllowed)
+		return
+	}
+	s.checkUploads(w, r, sh.folder)
 }
 
 // isResume reports whether r continues a download rather than starting one.
@@ -391,6 +651,49 @@ func (s *Server) shareListing(w http.ResponseWriter, snap Share, top, name strin
 	sharePage.Execute(w, map[string]any{
 		"Brand": brand.Name, "Title": title, "Root": snap.Name, "Sub": sub, "Up": name != top,
 		"Rows": rows, "Notes": strings.Join(notes, " · "),
+	})
+}
+
+// pinPage asks for a link's PIN. It posts back to /s/<id> and then
+// returns to the page that was asked for.
+func (s *Server) pinPage(w http.ResponseWriter, r *http.Request, snap Share, wrong bool) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusUnauthorized)
+	what := "a file"
+	switch {
+	case snap.Request:
+		what = "a drop box for files"
+	case snap.Dir:
+		what = "a folder"
+	}
+	next := r.URL.Path
+	if r.URL.RawQuery != "" && r.Method == http.MethodGet {
+		next += "?" + r.URL.RawQuery
+	}
+	pinPageTmpl.Execute(w, map[string]any{"Brand": brand.Name, "ID": snap.ID, "What": what, "Next": next, "Wrong": wrong})
+}
+
+// requestPage renders the upload page of a file request.
+func (s *Server) requestPage(w http.ResponseWriter, snap Share) {
+	var notes []string
+	if !snap.Expires.IsZero() {
+		notes = append(notes, "open for "+humanize.Duration(time.Until(snap.Expires).Round(time.Minute)))
+	}
+	left := -1
+	if snap.MaxUses > 0 {
+		left = max(0, snap.MaxUses-snap.Uses)
+		notes = append(notes, fmt.Sprintf("%d file%s left", left, map[bool]string{true: "", false: "s"}[left == 1]))
+	}
+	if s.cfg.InboxMax > 0 {
+		notes = append(notes, "up to "+humanize.Bytes(s.cfg.InboxMax)+" per file")
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Frame-Options", "DENY")
+	requestPageTmpl.Execute(w, map[string]any{
+		"Brand": brand.Name, "ID": snap.ID, "Title": snap.Name, "Notes": strings.Join(notes, " · "),
+		"Left": left, "Max": s.cfg.InboxMax,
 	})
 }
 

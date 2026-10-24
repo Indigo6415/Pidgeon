@@ -23,9 +23,11 @@ import (
 	"golang.org/x/term"
 
 	"github.com/Indigo6415/pidgeon/internal/brand"
+	"github.com/Indigo6415/pidgeon/internal/certs"
 	"github.com/Indigo6415/pidgeon/internal/devices"
 	"github.com/Indigo6415/pidgeon/internal/humanize"
 	"github.com/Indigo6415/pidgeon/internal/listeners"
+	"github.com/Indigo6415/pidgeon/internal/mdns"
 	"github.com/Indigo6415/pidgeon/internal/pull"
 	"github.com/Indigo6415/pidgeon/internal/server"
 	"github.com/Indigo6415/pidgeon/internal/stats"
@@ -59,6 +61,14 @@ type config struct {
 	limit       string // cap on all downloads together, e.g. "5M" (per second)
 	clientLimit string // cap on each device's downloads
 	noThumbs    bool   // no image thumbnails in the web UI's grid view
+
+	inboxSort string // "date": file uploads into YYYY/MM folders
+	tls       string // "auto" or "cert.pem,key.pem": serve HTTPS
+	tv        bool   // act as a DLNA media server for TVs
+	tvName    string // the name TVs show
+	noMDNS    bool   // don't announce the server on the network
+	flock     bool   // let visitors browse the Nearby servers through this one
+	receipts  string // append delivery receipts to this JSON Lines file
 }
 
 // Reasons the server stops on its own (--expire, --once, --max-bytes); the
@@ -75,6 +85,9 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	// Subcommands come first; everything else is the server.
 	if len(args) > 0 && args[0] == "pull" {
 		return pull.Main(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "find" {
+		return pull.Find(args[1:], stdout, stderr)
 	}
 	cfg, code := parseFlags(args, stderr)
 	if code >= 0 {
@@ -116,9 +129,16 @@ func parseFlags(args []string, stderr io.Writer) (config, int) {
 	fs.StringVar(&c.limit, "limit", "", "cap the total download speed, e.g. 5M (per second; changeable in the dashboard)")
 	fs.StringVar(&c.clientLimit, "client-limit", "", "cap each device's download speed, e.g. 2M (per second)")
 	fs.BoolVar(&c.noThumbs, "no-thumbs", false, "don't generate image thumbnails for the web UI's grid view")
+	fs.StringVar(&c.inboxSort, "inbox-sort", "", `"date": file uploads into YYYY/MM folders by when they were taken (camera roll backups)`)
+	fs.StringVar(&c.tls, "tls", "", `serve HTTPS: "auto" (a self-signed certificate, kept between runs) or "cert.pem,key.pem"`)
+	fs.BoolVar(&c.tv, "tv", false, "also be a DLNA media server, so TVs and media players can browse and play videos, music and photos")
+	fs.StringVar(&c.tvName, "tv-name", "", "the name TVs show for --tv (default: "+brand.Name+" · <folder>)")
+	fs.BoolVar(&c.noMDNS, "no-mdns", false, "don't announce the server on the network (used by "+brand.Command+" find, pull and the web UI's Nearby list)")
+	fs.BoolVar(&c.flock, "flock", false, "let visitors open the other "+brand.Name+" servers on the network in place, as folders, and mix their files into ZIPs")
+	fs.StringVar(&c.receipts, "receipts", "", "append a delivery receipt (who got which file, when, its SHA-256) to this file, one JSON line each")
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "%s — %s\n\n", brand.Name, brand.Tagline)
-		fmt.Fprintf(stderr, "Usage:\n  %s [flags] [directory]\n  %s [flags] <path> <path>...   (several folders and files side by side)\n  %s pull <url> [target-dir]   (preview)\n\n", brand.Command, brand.Command, brand.Command)
+		fmt.Fprintf(stderr, "Usage:\n  %s [flags] [directory]\n  %s [flags] <path> <path>...   (several folders and files side by side)\n  %s pull [url] [target-dir]   (download a folder from another server)\n  %s find                      (list the servers on this network)\n\n", brand.Command, brand.Command, brand.Command, brand.Command)
 		fmt.Fprintf(stderr, "%s is the same program as %s.\n\nFlags:\n", brand.Alias, brand.Command)
 		fs.PrintDefaults()
 	}
@@ -183,6 +203,18 @@ func serve(cfg config, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	switch {
+	case cfg.inboxSort != "" && cfg.inboxSort != "date":
+		return errors.New(`--inbox-sort: the only order is "date"`)
+	case cfg.inboxSort != "" && cfg.inbox == "":
+		return errors.New("--inbox-sort needs --inbox")
+	case cfg.flock && cfg.noMDNS:
+		// The flock is made of the servers the mDNS scan finds.
+		return errors.New("--flock finds the other servers over mDNS, so it can't be combined with --no-mdns")
+	case cfg.tv && cfg.tls != "":
+		// TVs only speak plain HTTP and would reject a self-signed certificate.
+		return errors.New("--tv can't be combined with --tls: TVs only play over plain HTTP")
+	}
 	var inboxMax int64
 	if cfg.inboxMax != "" {
 		if cfg.inbox == "" {
@@ -221,18 +253,46 @@ func serve(cfg config, stdout, stderr io.Writer) error {
 				humanize.Bytes(e.Bytes), humanize.Duration(e.Duration))
 		})
 	}
+	// Delivery receipts can go to a file as well as the dashboard.
+	if cfg.receipts != "" {
+		write, closeFile, err := receiptsWriter(cfg.receipts)
+		if err != nil {
+			return fmt.Errorf("--receipts: %w", err)
+		}
+		defer closeFile()
+		store.OnReceipt(write)
+	}
 	go store.Run(ctx)
 
 	reg := devices.New(cfg.ask, devices.TrustFile(brand.Command))
 	var mgr *listeners.Manager
-	srv, err := server.New(server.Config{
+	var responder *mdns.Responder // set once the server is announced
+	selfID := func() string {
+		if responder == nil {
+			return ""
+		}
+		return responder.ID()
+	}
+	scfg := server.Config{
 		Paths: paths, ShowHidden: cfg.hidden, Token: token, NoThumbs: cfg.noThumbs,
 		BasicUser: user, BasicPass: pass, Store: store, Assets: web.Assets(),
-		Devices: reg, Inbox: cfg.inbox, InboxMax: inboxMax,
+		Devices: reg, Inbox: cfg.inbox, InboxMax: inboxMax, InboxSort: cfg.inboxSort,
 		MaxBytes: lim.MaxBytes, Expires: lim.Deadline, Once: lim.Once,
+		TV: cfg.tv, TVName: cfg.tvName, TVSecretFile: server.TVSecretFile(brand.Command),
 		// Share links point at the address other devices can reach.
 		BaseURL: func() string { return listeners.ReachableURL(mgr.List()) },
-	})
+	}
+	if !cfg.noMDNS {
+		scfg.Nearby = nearby(selfID)
+		scfg.Flock = cfg.flock
+	}
+	// Headless, messages from devices are printed like requests.
+	if !interactive {
+		scfg.OnPost = func(m server.Message) {
+			fmt.Fprintf(stdout, "%s  message from %s: %s\n", m.Time.Format("15:04:05"), m.From, m.Text)
+		}
+	}
+	srv, err := server.New(scfg)
 	if err != nil {
 		return err
 	}
@@ -242,6 +302,16 @@ func serve(cfg config, stdout, stderr io.Writer) error {
 	ids, err := selectListeners(mgr, cfg.bind)
 	if err != nil {
 		return err
+	}
+	// HTTPS: every listener gets the certificate.
+	fingerprint := ""
+	if cfg.tls != "" {
+		tlsCfg, fp, err := certs.Load(cfg.tls, certs.Dir(brand.Command), machineAddrs(mgr))
+		if err != nil {
+			return fmt.Errorf("--tls: %w", err)
+		}
+		mgr.SetTLS(tlsCfg)
+		fingerprint = fp
 	}
 	// Bind before anything is drawn: the splash never delays serving.
 	port, err := mgr.Start(ids)
@@ -253,9 +323,33 @@ func serve(cfg config, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "port %d is busy, using %d instead\n", cfg.port, port)
 	}
 
+	// Announce the server (and TV mode) on the network. Neither is fatal.
+	var notes netNotes
+	if !cfg.noMDNS {
+		r, inst, err := announce(srv, mgr, authMode(token, user), fingerprint)
+		if err != nil {
+			notes.mdnsErr = err.Error()
+		} else {
+			responder, notes.mdnsName = r, inst
+			defer r.Close()
+		}
+	}
+	if cfg.tv {
+		a, err := advertiseTV(srv, mgr)
+		if err != nil {
+			notes.tvErr = err.Error()
+		} else {
+			notes.tvName = srv.TVName()
+			defer a.Close()
+		}
+	}
+	notes.fingerprint, notes.receipts, notes.inboxSort = fingerprint, cfg.receipts, cfg.inboxSort
+	notes.flock = cfg.flock
+
 	infos := mgr.List()
 	urls := printBanner(stdout, dir, infos, token, authMode(token, user))
 	printExtras(stdout, srv.Inbox(), inboxMax, cfg.ask, lim, rates)
+	printNetwork(stdout, notes)
 	reportBindErrors(stderr, infos)
 	go watchLimits(ctx, finish, store, lim)
 
@@ -266,6 +360,7 @@ func serve(cfg config, stdout, stderr io.Writer) error {
 			Ctx: ctx, Store: store, Manager: mgr, Dir: dir, Roots: paths, Token: token,
 			AuthMode: authMode(token, user), Splash: splash, URLs: urls,
 			Server: srv, Devices: reg, Limits: lim,
+			Fingerprint: fingerprint, MDNSName: notes.mdnsName, TVName: notes.tvName,
 		})
 	} else {
 		// Ctrl+C only reaches a process that owns the terminal.
@@ -404,6 +499,62 @@ func printExtras(w io.Writer, inbox string, inboxMax int64, ask bool, lim tui.Li
 			parts = append(parts, humanize.Rate(float64(rates[1]))+" per device")
 		}
 		lipgloss.Fprintln(w, "  speed limit: "+bold.Render(strings.Join(parts, ", "))+muted.Render("  (change it from the dashboard's esc menu)"))
+		printed = true
+	}
+	if printed {
+		lipgloss.Fprintln(w)
+	}
+}
+
+// netNotes are the network features to mention in the startup banner.
+type netNotes struct {
+	fingerprint string // HTTPS certificate, lowercase hex
+	mdnsName    string // name the server is announced under
+	mdnsErr     string
+	tvName      string // TV mode's name
+	tvErr       string
+	receipts    string // receipts file
+	inboxSort   string
+	flock       bool // nearby servers open in the web UI
+}
+
+// printNetwork lists HTTPS, discovery, TV mode and receipts in the banner.
+func printNetwork(w io.Writer, n netNotes) {
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("#8b949e"))
+	bold := lipgloss.NewStyle().Bold(true)
+	warn := lipgloss.NewStyle().Foreground(lipgloss.Color("#d29922"))
+	printed := false
+	if n.fingerprint != "" {
+		lipgloss.Fprintln(w, "  https certificate SHA-256: "+bold.Render(certs.Pretty(n.fingerprint, 0)))
+		lipgloss.Fprintln(w, muted.Render("    browsers warn once about a self-signed certificate: check that the fingerprint they show starts like this"))
+		printed = true
+	}
+	if n.inboxSort == "date" {
+		lipgloss.Fprintln(w, "  inbox sorted "+bold.Render("by date")+muted.Render("  (YYYY/MM folders; copies of files already there are skipped)"))
+		printed = true
+	}
+	switch {
+	case n.mdnsName != "":
+		lipgloss.Fprintln(w, "  on the network as "+bold.Render(n.mdnsName)+muted.Render("  ("+brand.Command+" find, "+brand.Command+" pull)"))
+		printed = true
+	case n.mdnsErr != "":
+		lipgloss.Fprintln(w, warn.Render("  not announced on the network: "+n.mdnsErr))
+		printed = true
+	}
+	if n.flock {
+		lipgloss.Fprintln(w, "  flock: "+bold.Render("nearby servers open in the web UI")+muted.Render("  (they see the requests as coming from this computer)"))
+		printed = true
+	}
+	switch {
+	case n.tvName != "":
+		lipgloss.Fprintln(w, "  TV mode: "+bold.Render(n.tvName)+muted.Render("  (media files are playable by any TV or player on the network)"))
+		printed = true
+	case n.tvErr != "":
+		lipgloss.Fprintln(w, warn.Render("  TV mode is off: "+n.tvErr))
+		printed = true
+	}
+	if n.receipts != "" {
+		lipgloss.Fprintln(w, "  delivery receipts: "+bold.Render(n.receipts))
 		printed = true
 	}
 	if printed {

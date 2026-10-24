@@ -219,12 +219,18 @@ type Store struct {
 	peakRate  float64
 	rate      float64 // smoothed aggregate rate
 
+	receipts   []Receipt           // completed deliveries, oldest first
+	received   map[string]*Receipt // latest file receipt by device + path
+	receivedBy map[string]int      // indexed receipts per device IP
+	deliveries int64               // receipts ever recorded
+
 	// sampler-only bookkeeping
 	lastBytes  int64
 	bucket     int64
 	bucketFrom time.Time
 
-	onLog func(LogEntry) // optional; headless mode prints requests
+	onLog     func(LogEntry) // optional; headless mode prints requests
+	onReceipt func(Receipt)  // optional; --receipts writes them to a file
 }
 
 // New creates an empty store. Call Run to start the rate sampler.
@@ -235,6 +241,8 @@ func New() *Store {
 		transfers:  map[uint64]*Transfer{},
 		clients:    map[string]*Limiter{},
 		hits:       map[string]int64{},
+		received:   map[string]*Receipt{},
+		receivedBy: map[string]int{},
 		log:        make([]LogEntry, logSize),
 		bucketFrom: now,
 	}

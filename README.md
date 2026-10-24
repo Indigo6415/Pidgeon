@@ -20,6 +20,15 @@ phone, and grab what you need.
 - **Real file serving.** Correct `Content-Type` and `Content-Length`, HTTP Range
   (resumable and seekable), and streaming throughout. Nothing is ever loaded fully
   into memory.
+- **Between machines.** `pidgeon pull` copies a folder from another Pidgeon into a
+  directory, resumable and only fetching what changed; `pidgeon find` lists the
+  servers on the network. With `--flock`, the other servers open in place in the
+  web UI, and one ZIP can mix their files with yours. HTTPS with `--tls auto`.
+- **Between people.** Share links with an optional PIN, file requests (a link
+  others upload with), Pigeon Post (text between the dashboard and a browser),
+  and delivery receipts of who received what.
+- **On the TV.** `--tv` makes the folder a DLNA media server; any folder also
+  plays as an `.m3u` playlist in VLC or mpv.
 
 > Screenshots: _TUI dashboard_ · _web UI (desktop)_ · _web UI (phone)_ go here.
 
@@ -34,6 +43,14 @@ pidgeon --bind all       # listen on every interface (0.0.0.0) from the start
 pidgeon --headless       # no dashboard, just URLs + a request log
 pidgeon ~/Movies ~/Photos report.pdf   # several folders and files side by side
 pidgeon --limit 5M       # cap downloads at 5 MB/s in total (--client-limit caps each device)
+pidgeon --tls auto       # HTTPS with a self-signed certificate kept between runs
+pidgeon --tv ~/Movies    # also show up on TVs and media players as a media server
+pidgeon --inbox ~/Phone --inbox-sort date   # phone backups, filed by date, no duplicates
+pidgeon --flock          # browse the other Pidgeon servers on the network from this one
+
+pidgeon find                           # list the Pidgeon servers on this network
+pidgeon pull                           # pull from the server on this network into ./<its name>
+pidgeon pull http://192.168.1.20:8080/#/Photos ~/Photos   # one folder, into ~/Photos
 ```
 
 | Flag | Default | Meaning |
@@ -48,6 +65,13 @@ pidgeon --limit 5M       # cap downloads at 5 MB/s in total (--client-limit caps
 | `--limit` | — | Cap the total download speed, e.g. `5M` (per second). Changeable live from the dashboard. |
 | `--client-limit` | — | Cap each device's download speed, e.g. `2M`. |
 | `--no-thumbs` | off | Don't make image thumbnails for the grid view. Thumbnails are cached in your user cache folder, never in the served folder. |
+| `--inbox-sort` | — | `date`: file uploads into `YYYY/MM` folders by when they were taken (EXIF or the video's header, else the file's modification time). Needs `--inbox`. |
+| `--tls` | — | Serve HTTPS: `auto` (a self-signed certificate, kept in your config folder so its fingerprint stays the same) or `cert.pem,key.pem`. |
+| `--tv` | off | Also be a DLNA / UPnP media server for TVs, consoles, VLC and Kodi. Not with `--tls`. |
+| `--tv-name` | `Pidgeon · <folder>` | The name TVs show. |
+| `--receipts` | — | Append a delivery receipt (device, file, time, size, SHA-256) to this file, one JSON line each. |
+| `--no-mdns` | off | Don't announce the server on the network (`pidgeon find`, `pull` and the web UI's Nearby list use the announcement). |
+| `--flock` | off | Open the Nearby servers in place in the web UI, as folders, through this server. Not with `--no-mdns`. |
 | `--version` | | Print the version and exit. |
 
 Several paths (`pidgeon ~/Movies ~/Photos report.pdf`) are served side by side:
@@ -71,12 +95,26 @@ Everything works with the arrow keys, Enter and Esc alone:
 
 Letter shortcuts for the same actions: `space` toggle, `tab` switch panel,
 `x` cancel transfer, `p` pause or resume transfer, `c` copy URL (OSC 52 clipboard), `o` open in browser,
+`s` new share link, `m` Pigeon Post, `d` switch the bottom panel between requests and deliveries,
 `?` all keys, `q` quit. If downloads are in progress, `q` asks you to press it
 again, and the quit item in the Esc menu shows how many will be cancelled.
 `ctrl+c` always quits immediately.
 
 The QR code follows the listener under the cursor. If that listener isn't serving,
-it falls back to the primary LAN address.
+it falls back to the primary LAN address. With `--tls` it also shows the start of the
+certificate's fingerprint.
+
+From the Esc menu:
+
+- **Create a share link…** picks a file or folder, then the expiry, the number of
+  downloads and an optional PIN (random or your own). The visitor types the PIN once;
+  ten wrong guesses lock the link.
+- **Request files…** (with `--inbox`) makes a link the other way round: its page is a
+  drop zone, and the files land in their own folder of the inbox. Its limit counts files.
+- **Pigeon Post…** sends text to a device's browser. Text a device sends pops up in
+  the dashboard, where `c` copies it, `o` opens a link in it and `r` replies.
+- **Deliveries…** lists every file and ZIP that reached a device in full, with its
+  SHA-256 (`--receipts` also writes them to a file).
 
 ### Listeners
 
@@ -110,6 +148,14 @@ It uses VS Code's colours, with a layout of its own:
 - **Status line** showing item count, selection size, live download speed and the
   auth mode.
 
+Files this device already downloaded in full are ticked (✓) until they change on
+disk. The speech-bubble button in the top bar opens **Pigeon Post**: paste a link or a
+note and it shows up in the host's terminal; text the host sends pops up as a
+notification. The sidebar lists other Pidgeon servers found on the network under
+**Nearby**. The command palette can **Request Files from Someone…** (a file-request
+link, with `--inbox`) and **Play Folder in a Media Player (.m3u)**, a playlist VLC,
+mpv or Infuse streams straight from the server.
+
 Big folders stay quick. Only the rows on screen are drawn, and the subfolders on
 screen are summarised lazily: their item counts, and whether the tree needs a
 chevron, arrive in small batches from `/api/peek`. Listings are cached and
@@ -131,7 +177,7 @@ slide-out drawer, rows get bigger, and downloads open as a bottom sheet.
 | `⌘↑` / `Alt+↑` / `Backspace` | Go to the parent folder |
 | `⌘A`, `Esc` | Select all, clear the selection |
 | Click, `⌘`-click, `Shift`-click | Select, toggle, select range. Folders open on click; files download on double-click. |
-| Right-click | Download, Open Preview, Add to Basket, Copy Link, **Copy as cURL**, Show SHA-256 |
+| Right-click | Download, Open Preview, Add to Basket, Copy Link, **Copy as cURL**, Show SHA-256; on a folder, Play as Playlist (.m3u) |
 | `⇧B` | Add the selection to the basket, or take it out |
 
 ### Downloads in the browser
@@ -153,8 +199,67 @@ slide-out drawer, rows get bigger, and downloads open as a bottom sheet.
 A browser always decides where its own downloads go: your Downloads folder or a
 save dialog. The server can't write into a folder of your choosing, so the ZIP is
 what preserves the folder structure. If you want files written straight into a
-directory, that is what `pidgeon pull <url> [dir]` is for. That subcommand is
-currently a stub; its planned design is in `internal/pull/pull.go`.
+directory, use `pidgeon pull`.
+
+### Uploads
+
+With `--inbox <dir>`, visitors can drop files anywhere on the page to send them to
+you. Before sending, the browser asks which files the inbox already has (by size and
+a quick fingerprint) and skips them, and the server drops any exact copy that still
+arrives, so backing up a phone twice only sends what's new. The sender's modification
+time is kept. `--inbox-sort date` files everything into `YYYY/MM` folders by when it
+was taken.
+
+### The flock
+
+With `--flock`, the servers in the sidebar's **Nearby** list open in place instead of
+in a new tab: each one is a folder with its own subtree, and its files list, preview,
+download, hash and go into the basket like local ones. This server fetches them from
+the other one for you, so a ZIP (or the basket) can mix files from several machines;
+each server's files go in a folder named after it. Downloads show in the dashboard and
+the downloads panel like any other.
+
+A server that needs a token asks for it in place of its listing. The token is kept in
+a cookie of that browser only, so typing it gives nobody else access. The other
+server sees the requests as coming from this computer (so with `--ask`, it approves
+this computer). Share links, playlists and TV mode stay limited to this server's own
+files, and the flock is one hop deep: a server never passes on a request that another
+flock relayed.
+
+`pidgeon pull` works on a flock folder too (`…/#/.flock/<id>/Photos`), for a server
+that needs no token.
+
+### `pidgeon pull` and `pidgeon find`
+
+```sh
+pidgeon find                                   # servers on this network (mDNS)
+pidgeon pull [url] [dir]                       # a folder (or file) into dir
+pidgeon pull --mirror --verify <url> dir       # also replace changed files; check every SHA-256
+```
+
+`pull` takes the server's address, a folder link copied from the web UI
+(`…/#/Photos`), a file link (`…/f/…`), or a share link (`…/s/…`, with `--pin` if it
+has one). Without a URL it finds the server on the network, asking which one if there
+are several. The target defaults to the remote folder's name, like `git clone`.
+
+Folders are recreated as they are; a file arrives as `<name>.part` and is renamed when
+complete, with the server's modification time. An interrupted run resumes the
+`.part` files, and dropped connections are retried the same way. Files already there
+with the same size and time are skipped, so running it again only fetches what's new.
+A local file that differs is kept unless you pass `--mirror`. `--verify` compares
+every file with the server's SHA-256. `-j` sets how many files download at once
+(default 4). `--token` is needed for a protected server (or `?token=` in the URL).
+
+Over HTTPS, a self-signed certificate is accepted when its fingerprint matches
+`--fingerprint`, the one the server announces on the network, or, on a terminal,
+after you compare it with the dashboard's and say yes.
+
+### TV mode
+
+`--tv` announces the served folder on the network (SSDP) as a DLNA / UPnP media
+server, so smart TVs, consoles, VLC and Kodi list it under media servers. They browse
+folders, videos, music and photos (with thumbnails) and play with seeking. Only media
+files are offered.
 
 ## Install
 
@@ -219,15 +324,35 @@ That's fine on your home Wi-Fi and wrong on a café network.
 - `--auth user:pass` adds HTTP basic auth instead of, or as well as, a token.
 - "Copy as cURL" includes the token as a Bearer header. `/api/info` returns the token
   only to visitors who are already authenticated.
-- Both are sent in plain HTTP. They keep out casual visitors on a network you
-  mostly trust. They are not protection against someone sniffing that network.
-  Use a VPN listener (e.g. Tailscale) to cross untrusted networks.
+- Without `--tls`, both are sent in plain HTTP. They keep out casual visitors on a
+  network you mostly trust, not someone sniffing it. `--tls auto` encrypts
+  everything with a self-signed certificate. Browsers warn about it once, because
+  they can't know it is yours: check that the SHA-256 fingerprint they show matches
+  the one in the banner and the dashboard. A VPN listener (e.g. Tailscale) is the
+  other way across untrusted networks.
+- Share links can require a PIN. The link alone then isn't enough, and ten wrong
+  PINs lock it.
+- `--tv` makes the media files (videos, music, pictures) playable by anything on the
+  network, even with `--token`, because TVs can't log in. They are reached through a
+  random path that only the network announcement reveals. `--ask` still makes a TV
+  wait for your approval like any new device.
+- `.m3u` playlists carry the access token in their links, because media players
+  can't log in. Treat a playlist like a link.
+- The server announces itself on the local network (mDNS) with its folder's name,
+  port, and whether it needs a token. `--no-mdns` turns that off.
+- `--flock` lets anyone who can reach this server browse the other servers it finds,
+  even ones they couldn't reach directly (from a VPN listener, say). It only connects
+  to the address a server's own announcement came from, never to loopback. Files it
+  relays are sandboxed like served HTML, whatever type the other server claims. A
+  server that needs a token stays closed until each visitor types it.
 
 What's always enforced:
 
-- The server is read-only. There are no upload, delete or rename endpoints.
-  Archives (`.zip`, `.tar`, `.tar.gz`) are browsed by reading them in place;
-  nothing is ever extracted to disk.
+- The served folder is read-only. There are no delete or rename endpoints, and the
+  only writable place is the inbox (`--inbox`), which uploads and file requests
+  write into through their own `os.Root` and never overwrite. Archives (`.zip`,
+  `.tar`, `.tar.gz`) are browsed by reading them in place; nothing is ever extracted
+  to disk.
 - All file access goes through Go's `os.Root`, which refuses `..` traversal and
   symlinks that point outside the served directory.
 - Dotfiles and dot-directories (`.git`, `.env`, `.ssh`, …) are hidden and refused
@@ -246,11 +371,16 @@ internal/
   brand/      the name, alias, tagline and pigeon art (rename here)
   app/        flags, startup banner, signals, graceful shutdown, headless mode
   listeners/  interface discovery + Manager: one http.Server per bound address
-  server/     http.Handler: /api/ls, /api/peek, /f/<path>, /api/zip + /zip/<token>, /api/events, auth
-  stats/      central store: atomic counters, transfer registry, 60s history, request log
+  server/     http.Handler: /api/ls, /api/peek, /f/<path>, /api/zip + /zip/<token>, /api/events, auth,
+              share links + file requests, the inbox, Pigeon Post, playlists, DLNA (/dlna/<key>/)
+  stats/      central store: atomic counters, transfer registry, 60s history, request log, receipts
   tui/        Bubble Tea app: splash → dashboard (Lipgloss, Bubbles key/help)
   web/        embed.FS with index.html, app.css, app.js (vanilla JS, no build step)
-  pull/       `pidgeon pull` stub
+  pull/       `pidgeon pull` and `pidgeon find`
+  certs/      the --tls certificate (self-signed, kept between runs) and fingerprint pinning
+  mcast/      IPv4 multicast on every interface, for discovery
+  mdns/       announces the server as _pidgeon._tcp and finds the others (and --flock relays to them)
+  ssdp/       announces --tv's media server to TVs
 ```
 
 How a download is measured: every request goes through a `ResponseRecorder`

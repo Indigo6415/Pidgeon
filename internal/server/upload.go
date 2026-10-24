@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -9,7 +11,9 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/Indigo6415/pidgeon/internal/listeners"
@@ -21,6 +25,9 @@ import (
 // so a half-sent file never looks finished. Names are reduced to a single
 // safe path segment and never overwrite: a clash becomes "name (1).ext".
 // All writes go through an os.Root, like reads, so nothing escapes the inbox.
+// File-request links upload into a subfolder of it; --inbox-sort date files
+// uploads into YYYY/MM folders by when they were taken; exact copies of a
+// file the inbox already holds are dropped (see dedupe.go).
 
 // openInbox prepares the upload directory, creating it if needed.
 func (s *Server) openInbox(dir string) error {
@@ -76,50 +83,76 @@ func within(dir, target string) (string, bool) {
 	return filepath.ToSlash(rel), true
 }
 
+// uploadTarget says where an upload goes inside the inbox.
+type uploadTarget struct {
+	dir   string // inbox-relative folder ("" = the inbox itself)
+	share string // the file-request link it came through, if any
+}
+
+// uploadResult is what receive reports back to its caller.
+type uploadResult struct {
+	ok        bool   // the file arrived in full
+	duplicate bool   // the inbox already had these exact bytes; nothing was kept
+	name      string // inbox-relative path it was saved as (or of the copy)
+}
+
 // handleUpload receives one file: PUT /api/upload?name=<file name> with the
-// raw file as the body. With --ask the operator approves it first.
+// raw file as the body (&mtime=<Unix ms> keeps its modification time). With
+// --ask the operator approves it first.
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	s.receive(w, r, uploadTarget{})
+}
+
+// receive stores one uploaded file under tgt and writes the response. The
+// body streams into "<name>.part" and is hashed as it arrives; an exact copy
+// of a file already in the target's folder tree is dropped, and otherwise
+// the file is renamed into place (into a YYYY/MM folder with
+// --inbox-sort date).
+func (s *Server) receive(w http.ResponseWriter, r *http.Request, tgt uploadTarget) uploadResult {
 	if s.inbox == nil {
 		http.Error(w, "uploads are not enabled on this server", http.StatusNotFound)
-		return
+		return uploadResult{}
 	}
-	name, err := cleanUploadName(r.URL.Query().Get("name"))
+	q := r.URL.Query()
+	name, err := cleanUploadName(q.Get("name"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return uploadResult{}
 	}
 	size := r.ContentLength
 	if s.cfg.InboxMax > 0 && size > s.cfg.InboxMax {
 		http.Error(w, "this file is larger than the server accepts", http.StatusRequestEntityTooLarge)
-		return
+		return uploadResult{}
 	}
 	ip := clientIP(r)
 	// --ask: hold the upload until the operator accepts or declines it.
 	if reg := s.cfg.Devices; reg != nil && !reg.AskUpload(r.Context(), ip, r.UserAgent(), name, size) {
 		http.Error(w, "the host declined this upload", http.StatusForbidden)
-		return
+		return uploadResult{}
 	}
 
-	final, f, err := s.reserveUpload(name)
+	held, f, err := s.reserveUpload(tgt.dir, name)
 	if err != nil {
 		http.Error(w, "couldn't create the file", http.StatusInternalServerError)
-		return
+		return uploadResult{}
 	}
-	defer s.releaseUpload(final)
-	part := final + ".part"
+	defer s.releaseUpload(held)
+	part := held + ".part"
 
 	t := s.cfg.Store.Begin(stats.TransferInfo{
 		Listener: listeners.IDFromContext(r.Context()),
 		Client:   ip,
-		Name:     s.uploadDisplay(final),
+		Name:     s.uploadDisplay(held),
 		Kind:     stats.KindUpload,
 		Total:    size,
+		Share:    tgt.share,
 	})
 	var body io.Reader = r.Body
 	if s.cfg.InboxMax > 0 {
 		body = http.MaxBytesReader(w, r.Body, s.cfg.InboxMax)
 	}
-	n, err := io.CopyBuffer(f, &stats.CountingReader{R: body, T: t, Store: s.cfg.Store}, make([]byte, 256<<10))
+	h := sha256.New()
+	n, err := io.CopyBuffer(io.MultiWriter(f, h), &stats.CountingReader{R: body, T: t, Store: s.cfg.Store}, make([]byte, 256<<10))
 	// A short body means the sender went away mid-file.
 	if err == nil && size >= 0 && n != size {
 		err = io.ErrUnexpectedEOF
@@ -129,9 +162,6 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.cfg.Devices != nil {
 		s.cfg.Devices.AddTraffic(ip, 0, n)
-	}
-	if err == nil {
-		final, err = s.finishUpload(part, final)
 	}
 	if err != nil {
 		s.inbox.Remove(part)
@@ -145,14 +175,74 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		default:
 			http.Error(w, "upload failed", http.StatusBadRequest)
 		}
-		return
+		return uploadResult{}
+	}
+
+	// The same bytes are already there: keep the inbox free of copies.
+	sum := hex.EncodeToString(h.Sum(nil))
+	if dup, ok := s.findCopy(scopeDir(tgt.dir), n, sum); ok {
+		s.inbox.Remove(part)
+		s.cfg.Store.End(t, stats.Completed)
+		writeJSON(w, http.StatusOK, map[string]any{"name": dup, "size": n, "duplicate": true})
+		return uploadResult{ok: true, duplicate: true, name: dup}
+	}
+
+	mtime := clientTime(q.Get("mtime"))
+	dest := tgt.dir
+	if s.cfg.InboxSort == "date" {
+		dest = path.Join(tgt.dir, s.dateFolder(part, n, mtime))
+	}
+	final, err := s.finishUpload(part, dest, name)
+	if err != nil {
+		s.inbox.Remove(part)
+		s.cfg.Store.End(t, stats.Aborted)
+		http.Error(w, "couldn't save the file", http.StatusInternalServerError)
+		return uploadResult{}
+	}
+	// Keep the sender's modification time, like a copy would.
+	if !mtime.IsZero() {
+		s.inbox.Chtimes(final, time.Now(), mtime)
+	}
+	if fi, err := s.inbox.Stat(final); err == nil {
+		s.inboxSeen.remember(s.inboxSeen.sums, inboxKey(final, fi), sum)
 	}
 	s.cfg.Store.End(t, stats.Completed)
-	out := map[string]any{"name": final, "size": n}
+	out := map[string]any{"name": final, "size": n, "sha256": sum}
 	if p := s.inboxPath(); p != "" {
-		out["folder"] = p
+		out["folder"] = path.Dir(path.Join(p, final))
 	}
 	writeJSON(w, http.StatusOK, out)
+	return uploadResult{ok: true, name: final}
+}
+
+// clientTime parses the sender's modification time (Unix ms); the zero
+// time when it is missing or implausible.
+func clientTime(v string) time.Time {
+	ms, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || ms <= 0 {
+		return time.Time{}
+	}
+	t := time.UnixMilli(ms)
+	if !plausible(t) {
+		return time.Time{}
+	}
+	return t
+}
+
+// dateFolder picks "YYYY/MM" for a received file: when the photo or video
+// was taken, else the sender's modification time, else today.
+func (s *Server) dateFolder(part string, size int64, mtime time.Time) string {
+	when := time.Now()
+	if !mtime.IsZero() {
+		when = mtime
+	}
+	if f, err := s.inbox.Open(part); err == nil {
+		if t, ok := mediaDate(f, size); ok {
+			when = t
+		}
+		f.Close()
+	}
+	return when.Format("2006/01")
 }
 
 // uploadDisplay names an upload for the dashboard: its served path when the
@@ -164,15 +254,21 @@ func (s *Server) uploadDisplay(name string) string {
 	return "inbox/" + name
 }
 
-// reserveUpload picks a free name based on name and creates its ".part"
-// file. The name stays reserved until releaseUpload, so two uploads of the
-// same file at once get different names.
-func (s *Server) reserveUpload(name string) (string, *os.File, error) {
+// reserveUpload picks a free name based on name in the inbox folder dir and
+// creates its ".part" file. The returned inbox-relative name stays reserved
+// until releaseUpload, so two uploads of the same file at once get
+// different names.
+func (s *Server) reserveUpload(dir, name string) (string, *os.File, error) {
+	if dir != "" {
+		if err := s.inbox.MkdirAll(dir, 0o755); err != nil {
+			return "", nil, err
+		}
+	}
 	s.uploadMu.Lock()
 	defer s.uploadMu.Unlock()
 	// Try "name", "name (1)", "name (2)", ... until one is free.
 	for i := range 1000 {
-		cand := numbered(name, i)
+		cand := path.Join(dir, numbered(name, i))
 		if s.uploading[cand] || s.inboxHas(cand) || s.inboxHas(cand+".part") {
 			continue
 		}
@@ -189,20 +285,28 @@ func (s *Server) reserveUpload(name string) (string, *os.File, error) {
 	return "", nil, errors.New("too many files with this name")
 }
 
-// finishUpload renames a completed ".part" file into place. If a file of
-// the same name appeared meanwhile, the next free number is used instead.
-func (s *Server) finishUpload(part, final string) (string, error) {
+// finishUpload renames a completed ".part" file into folder dir as name.
+// If that name is taken (or reserved by another upload), the next free
+// number is used instead. It returns the inbox-relative path.
+func (s *Server) finishUpload(part, dir, name string) (string, error) {
+	if dir != "" {
+		if err := s.inbox.MkdirAll(dir, 0o755); err != nil {
+			return "", err
+		}
+	}
 	s.uploadMu.Lock()
 	defer s.uploadMu.Unlock()
-	name := final
 	// Never replace a file that is already there.
-	for i := 1; s.inboxHas(name); i++ {
-		if i > 1000 {
-			return "", errors.New("too many files with this name")
+	for i := range 1001 {
+		cand := path.Join(dir, numbered(name, i))
+		// This upload's own reservation is free to take; others' aren't.
+		own := cand+".part" == part
+		if s.inboxHas(cand) || (!own && s.uploading[cand]) {
+			continue
 		}
-		name = numbered(final, i)
+		return cand, s.inbox.Rename(part, cand)
 	}
-	return name, s.inbox.Rename(part, name)
+	return "", errors.New("too many files with this name")
 }
 
 // releaseUpload frees a reserved name.

@@ -64,6 +64,9 @@
       <button id="up-btn" class="tb-btn" title="Send files to this computer" aria-label="Send files to this computer" hidden>
         <svg class="i"><use href="#i-upload"/></svg>
       </button>
+      <button id="post-btn" class="tb-btn" title="Pigeon Post: text to and from the host" aria-label="Messages">
+        <svg class="i"><use href="#i-chat"/></svg><span id="post-badge" class="badge" hidden>0</span>
+      </button>
       <button id="dl-btn" class="tb-btn" title="Downloads (⌘J)" aria-label="Downloads">
         <svg class="i"><use href="#i-download"/></svg><span id="dl-badge" class="badge" hidden>0</span>
       </button>
@@ -81,6 +84,11 @@
       </div>
       <div class="tree-root" id="tree-root" role="button" tabindex="-1"><svg class="i ic-folder"><use href="#i-folder"/></svg><span id="sb-root">Files</span></div>
       <ul class="tree" id="tree" role="tree"></ul>
+      <!-- Other Pidgeon servers on the network (mDNS) -->
+      <div class="nearby" id="nearby" hidden>
+        <div class="side-head"><span>Nearby</span></div>
+        <ul class="nearby-list" id="nearby-list" role="tree"></ul>
+      </div>
     </aside>
     <div class="sash" id="sash" aria-hidden="true"></div>
     <div class="scrim" id="scrim" hidden></div>
@@ -128,6 +136,21 @@
         </div>
         <ul class="dl-list" id="dl-list"></ul>
         <p class="dl-empty" id="dl-empty">No downloads yet. Click a file to download it, or select several to stream a ZIP that keeps the folder structure.</p>
+      </section>
+
+      <!-- Pigeon Post: short text between this page and the host's terminal -->
+      <section class="panel" id="post" aria-label="Pigeon Post" hidden>
+        <div class="panel-head">
+          <span class="panel-title">Pigeon Post</span>
+          <span class="panel-meta">text to and from the host</span>
+          <span class="flex"></span>
+          <button class="icon-btn" id="post-close" title="Close" aria-label="Close messages"><svg class="i"><use href="#i-x"/></svg></button>
+        </div>
+        <ul class="dl-list post-list" id="post-list"></ul>
+        <form class="post-form" id="post-form">
+          <textarea id="post-text" rows="2" maxlength="16000" placeholder="Paste a link or type a note for the host…" aria-label="Message"></textarea>
+          <button class="btn primary" type="submit">Send</button>
+        </form>
       </section>
 
       <!-- Basket: files and folders collected from anywhere, downloaded as one ZIP -->
@@ -226,6 +249,7 @@
   <symbol id="i-mail" viewBox="0 0 24 24"><rect x="3" y="5.5" width="18" height="13" rx="2"/><path d="m3.5 7 8.5 6 8.5-6"/></symbol>
   <symbol id="i-basket" viewBox="0 0 24 24"><path d="M3.5 9.5h17l-1.6 9.1a1.5 1.5 0 0 1-1.5 1.2H6.6a1.5 1.5 0 0 1-1.5-1.2zM8 9.5l3-5.5M16 9.5l-3-5.5M9 13v3.5M12 13v3.5M15 13v3.5"/></symbol>
   <symbol id="i-hash" viewBox="0 0 24 24"><path d="M9.5 4 7.5 20M16.5 4l-2 16M5 9h15M4 15h15"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v9a1.5 1.5 0 0 1-1.5 1.5H10l-4.5 4v-4h0A1.5 1.5 0 0 1 4 14.5z"/><path d="M8 9h8M8 12h5"/></symbol>
   <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6.5h11M9 12h11M9 17.5h11M4 6.5h1.5M4 12h1.5M4 17.5h1.5"/></symbol>
   <!-- File-type glyphs (filled, coloured per type in CSS) -->
   <symbol id="i-folder" viewBox="0 0 24 24"><path d="M2.5 6.5A1.5 1.5 0 0 1 4 5h5.2l2 2.2H20a1.5 1.5 0 0 1 1.5 1.5v9.8A1.5 1.5 0 0 1 20 20H4a1.5 1.5 0 0 1-1.5-1.5z"/></symbol>

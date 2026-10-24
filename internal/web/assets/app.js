@@ -15,6 +15,15 @@
 // Archives (.zip, .tar, .tar.gz) open like folders; the server reads them in
 // place. The grid view shows thumbnails of images. The basket collects files
 // and folders from anywhere in the tree into one ZIP.
+//
+// With the host's --flock on, the other Pidgeon servers in the Nearby list
+// open in place: their folders live under /.flock/<id>/ and the server
+// fetches them from there, so they browse, preview, download and go into
+// ZIPs and the basket like local ones.
+//
+// Pigeon Post carries short text between this page and the host's terminal.
+// Files this device already received in full are ticked in the listing (from
+// the server's delivery receipts). Uploads skip files the host already has.
 
 const $ = (sel, el = document) => el.querySelector(sel);
 const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
@@ -50,6 +59,10 @@ const state = {
   basket: new Map(loadJSON("basket", []).map((b) => [b.path, b])), // path -> { path, name, dir, size }
   basketPaths: loadJSON("basketPaths", true), // keep folder paths in the basket ZIP
   basketBytes: null,       // { bytes, partial } for the basket's folders
+  posts: new Map(),        // id -> Pigeon Post message
+  postUnread: 0,           // messages from the host not seen in the panel yet
+  nearby: [],              // other Pidgeon servers on the network, from /api/nearby
+  flock: new Map(),        // peer id -> nearby server, for those that open in place
 };
 
 const clientId = getClientId();
@@ -127,7 +140,25 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&
 /** Joins a folder path and a child name. */
 const join = (dir, name) => (dir === "/" ? "/" : dir + "/") + name;
 /** Returns the parent of a folder path. */
-const parentOf = (p) => (p === "/" ? "/" : p.slice(0, p.lastIndexOf("/")) || "/");
+const parentOf = (p) => (p === "/" || flockOf(p)?.root === p ? "/" : p.slice(0, p.lastIndexOf("/")) || "/");
+
+/* the flock: folders on other servers, "/.flock/<id>/..." */
+
+const FLOCK_RE = /^\/\.flock\/([0-9a-f]+)(?=\/|$)/;
+/** For a path on another server, its peer ID and that server's root
+ *  ("/.flock/<id>"); null for a path on this one. */
+function flockOf(p) {
+  const m = FLOCK_RE.exec(p);
+  return m ? { id: m[1], root: m[0] } : null;
+}
+/** A flock peer's name (its ID until the Nearby list has named it). */
+const peerName = (id) => state.flock.get(id)?.name || id;
+/** Where a folder is, as people read it: a server's root shows as its name. */
+function placeName(p) {
+  const f = flockOf(p);
+  if (f) return peerName(f.id) + p.slice(f.root.length);
+  return p === "/" ? state.info.root || "/" : p.slice(1);
+}
 /** Percent-encodes each path segment, keeping the slashes. */
 const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
 /** An inline reference to an icon in the sprite. */
@@ -215,7 +246,12 @@ async function api(url, opts) {
   const r = await fetch(url, opts);
   // Session expired or token changed: the root shows the token prompt.
   if (r.status === 401) { location.href = "/"; throw new Error("unauthorized"); }
-  if (!r.ok) throw new Error((await r.text()).trim() || r.statusText);
+  if (!r.ok) {
+    const err = new Error((await r.text()).trim() || r.statusText);
+    // A server in the flock that wants credentials says which kind.
+    err.login = r.headers.get("X-Pidgeon-Flock-Login") || "";
+    throw err;
+  }
   return r.json();
 }
 
@@ -407,7 +443,8 @@ async function load(path, { force = false } = {}) {
     state.view = [];
     state.win = null;
     $("#list").innerHTML = "";
-    showEmpty("Couldn't open this folder", err.message, true);
+    if (err.login) showFlockLogin(err);
+    else showEmpty("Couldn't open this folder", err.message, true);
     updateStatus();
   }
 }
@@ -452,20 +489,22 @@ function refreshEntries(entries) {
 
 /** Renders the breadcrumbs (ancestors only) and the folder title. */
 function renderCrumbs() {
-  const parts = state.path === "/" ? [] : state.path.slice(1).split("/");
-  const rootName = state.info.root || "Files";
-  let acc = "";
-  let html = parts.length ? `<a href="#/">${esc(rootName)}</a>` : "";
+  const f = flockOf(state.path);
+  // In the flock the trail starts at the other server, not at this one.
+  const top = f ? { name: peerName(f.id), path: f.root } : { name: state.info.root || "Files", path: "/" };
+  const parts = state.path === top.path ? [] : state.path.slice(top.path.length + (top.path === "/" ? 0 : 1)).split("/");
+  let acc = top.path;
+  let html = parts.length ? `<a href="#${esc(encPath(top.path))}">${esc(top.name)}</a>` : "";
   // One link per ancestor; the current folder is the title below.
   parts.slice(0, -1).forEach((p) => {
-    acc += "/" + p;
+    acc = join(acc, p);
     html += icon("i-chev", "i sep") + `<a href="#${esc(encPath(acc))}">${esc(p)}</a>`;
   });
   const nav = $("#crumbs");
   nav.innerHTML = html;
   nav.hidden = !parts.length;
   nav.scrollLeft = nav.scrollWidth;
-  const title = parts.at(-1) || rootName;
+  const title = parts.at(-1) || top.name;
   $("#folder-title").textContent = title;
   $("#folder-title").title = title;
   renderArchiveChip();
@@ -484,10 +523,16 @@ function currentArchive() {
 }
 const ARCHIVE_RE = /\.(zip|tar|tgz|tar\.gz)$/i;
 
-/** Shows the "inside an archive" chip in the folder header. */
+/** Shows the "inside an archive" (or "on another server") chip in the
+ *  folder header. */
 function renderArchiveChip() {
-  const arc = currentArchive(), chip = $("#fh-chip");
-  chip.hidden = !arc;
+  const arc = currentArchive(), chip = $("#fh-chip"), f = flockOf(state.path);
+  chip.hidden = !arc && !f;
+  if (!arc && f) {
+    chip.innerHTML = `<span class="fi ic-peer">${icon("i-hex", "")}</span><span>on ${esc(peerName(f.id))} · through ${esc(state.info.root || "this server")}</span>`;
+    chip.title = "These files are on another computer; this server fetches them for you";
+    return;
+  }
   if (!arc) return;
   const name = arc.slice(arc.lastIndexOf("/") + 1);
   const partial = state.partialArc.has(state.path) ? " · too big to list completely" : "";
@@ -658,11 +703,17 @@ function rowHTML(i) {
     ? `<a class="icon-btn act-preview" href="/f${esc(encPath(p))}?inline=1" target="_blank" rel="noopener" title="Open Preview" aria-label="Preview ${esc(e.name)}">${icon("i-eye")}</a>` : "";
   return `<li class="row${e.dir ? " dir" : ""}${e.archive ? " arc" : ""}${thumbable(e, p) ? " has-thumb" : ""}${sel ? " sel" : ""}${inBasket ? " in-basket" : ""}${i === state.cursor ? " cursor" : ""}${state.fresh.has(e.name) ? " fresh" : ""}" data-i="${i}" role="option" aria-selected="${sel}"${e.archive ? ' title="Archive · double-click to look inside"' : ""}>
     <label class="cb"><input type="checkbox" tabindex="-1" ${sel ? "checked" : ""} aria-label="Select ${esc(e.name)}"><span></span></label>
-    <span class="name-cell">${iconHTML(e, p, fi)}<span class="meta"><span class="name">${esc(e.name)}</span><span class="sub">${esc(rowSub(e))}</span></span></span>
+    <span class="name-cell">${iconHTML(e, p, fi)}<span class="meta"><span class="name">${esc(e.name)}${gotHTML(e)}</span><span class="sub">${esc(rowSub(e))}</span></span></span>
     <span class="size">${e.dir ? esc(folderSize(e)) : fmtBytes(e.size)}</span>
     <span class="date">${fmtDate(e.mtime)}</span>
     <span class="acts">${preview}<button class="icon-btn act-link" title="Copy Link" aria-label="Copy link">${icon("i-link")}</button><button class="icon-btn act-dl" title="${e.dir ? "Download as ZIP" : "Download"}" aria-label="Download ${esc(e.name)}">${icon("i-download")}</button></span>
   </li>`;
+}
+
+/** A tick for a file this device already received in full (this version). */
+function gotHTML(e) {
+  if (!e.got) return "";
+  return `<span class="got" title="You downloaded this ${esc(fmtAgo(e.got))}">${icon("i-check")}</span>`;
 }
 
 /* lazy folder summaries: the subfolders in the drawn rows are summarised in
@@ -766,13 +817,16 @@ function scheduleTree() {
   if (!treeFrame) treeFrame = requestAnimationFrame(() => { treeFrame = 0; renderTree(); });
 }
 
-/** Expands every ancestor of path so the current folder is visible. */
+/** Expands every ancestor of path so the current folder is visible. A
+ *  folder in the flock unfolds under its server in the Nearby list. */
 function revealInTree(path) {
-  let acc = "/";
   treeNode("/").open = true;
   loadTreeDirs("/");
+  const f = flockOf(path);
+  let acc = f ? f.root : "/";
+  if (f) { treeNode(acc).open = true; loadTreeDirs(acc); }
   // Open and load each ancestor in turn.
-  for (const seg of path === "/" ? [] : path.slice(1).split("/")) {
+  for (const seg of path === acc ? [] : path.slice(acc.length + (acc === "/" ? 0 : 1)).split("/")) {
     acc = join(acc, seg);
     const n = treeNode(acc);
     n.open = true;
@@ -787,10 +841,11 @@ function renderTree() {
   $("#sb-root").textContent = state.info.root || "Files";
   $("#tree-root").classList.toggle("current", state.path === "/");
   $("#tree").innerHTML = treeChildren("/", 0);
+  renderNearby();
   // Scroll the current folder into view once per navigation, not on every
   // lazy update, so the tree doesn't jump while you scroll it.
   if (treeRevealed !== state.path) {
-    const cur = $("#tree .tnode.current");
+    const cur = $("#tree .tnode.current, #nearby-list .tnode.current");
     if (cur || state.path === "/") { cur?.scrollIntoView({ block: "nearest" }); treeRevealed = state.path; }
   }
 }
@@ -1007,9 +1062,12 @@ function ensureEvents() {
     try { items = JSON.parse(ev.data); } catch { return; }
     // Merge the server's view into our records; the latest request for an
     // ID wins (a download can be retried or resumed).
+    let ticked = false;
     for (const it of items) {
       const d = state.downloads.get(it.id);
       if (!d || d.state === "dismissed") continue;
+      // A file that just arrived in full gets its tick in the listing.
+      if (it.state === "done" && d.state !== "done" && d.kind === "file" && d.entry && !it.changed) { d.entry.got = Date.now(); ticked = true; }
       d.sent = it.sent;
       if (it.total >= 0) d.total = it.total;
       d.rate = it.rate;
@@ -1019,10 +1077,12 @@ function ensureEvents() {
       d.limit = it.limit || 0;
       d.changed = !!it.changed;
     }
+    if (ticked) renderWindow(true);
     renderDownloads();
   };
   events.addEventListener("change", (ev) => { try { folderChanged(JSON.parse(ev.data)); } catch {} });
   events.addEventListener("send", (ev) => { try { showSendNote(JSON.parse(ev.data)); } catch {} });
+  events.addEventListener("post", (ev) => { try { addPost(JSON.parse(ev.data)); } catch {} });
 }
 
 /** Kept for the panel's dismiss button; the stream now stays open. */
@@ -1031,9 +1091,10 @@ function maybeCloseEvents() {}
 /* live folder: the server polls the folder this tab shows and pushes a
    "change" event when something is added, removed or modified */
 
-/** Tells the server which folder this tab is showing. */
+/** Tells the server which folder this tab is showing. Folders on other
+ *  servers aren't watched: they refresh when you open them. */
 function watchFolder(path) {
-  if (!events || events.readyState !== EventSource.OPEN) return;
+  if (!events || events.readyState !== EventSource.OPEN || flockOf(path)) return;
   const q = new URLSearchParams({ c: clientId, path });
   fetch("/api/watch?" + q, { method: "POST" }).catch(() => {});
 }
@@ -1081,7 +1142,7 @@ function renderDownloads() {
     const pct = d.total > 0 ? Math.min(100, (d.sent / d.total) * 100) : 0;
     switch (d.state) {
       case "queued":
-        info = d.kind === "upload" ? "queued" : (Date.now() - d.added) / 1000 > 15 ? "waiting for browser…" : "starting…";
+        info = d.kind === "upload" ? (d.checking ? "checking what the host has…" : "queued") : (Date.now() - d.added) / 1000 > 15 ? "waiting for browser…" : "starting…";
         prog = `<div class="prog queued"><i></i></div>`;
         break;
       case "active":
@@ -1104,7 +1165,9 @@ function renderDownloads() {
         if (d.limit && !d.paused) info += ` · <span class="muted">capped at ${fmtBytes(d.limit)}/s</span>`;
         break;
       case "done":
-        info = d.kind === "upload" ? `<span class="ok">✓</span> sent · saved as ${esc(d.savedAs || d.name)}` : `<span class="ok">✓</span> ${fmtBytes(d.sent)}`;
+        info = d.kind !== "upload" ? `<span class="ok">✓</span> ${fmtBytes(d.sent)}`
+          : d.dup ? `<span class="ok">✓</span> already on the host${d.savedAs ? " as " + esc(d.savedAs) : ""}`
+          : `<span class="ok">✓</span> sent · saved as ${esc(d.savedAs || d.name)}`;
         prog = `<div class="prog done"><i></i></div>`;
         // The file was being written while it downloaded: this copy may be torn.
         if (d.changed) {
@@ -1131,6 +1194,7 @@ function togglePanel(force) {
   const p = $("#panel");
   const show = force ?? p.hidden;
   if (show && !$("#basket").hidden) $("#basket").hidden = true;
+  if (show) togglePosts(false);
   p.hidden = !show;
   $("#dl-btn").classList.toggle("active", show);
 }
@@ -1183,6 +1247,8 @@ const pal = { items: [], active: 0, sepAt: -1, sepText: "" };
 /** The commands available from "> ". */
 function commands() {
   const sel = state.sel.size;
+  // Share links and playlists only reach this server's own files.
+  const local = !flockOf(state.path);
   return [
     { label: "Download Selection", desc: sel ? `${sel} item(s)` : "nothing selected", key: "", run: downloadSelection },
     { label: "Select All", key: `${MOD}A`, run: () => { selectRange(0, state.view.length - 1); selectionChanged(); } },
@@ -1203,8 +1269,12 @@ function commands() {
     { label: "Basket: Empty", run: clearBasket },
     { label: "File: Show SHA-256…", run: () => { const e = state.view[state.cursor]; e && !e.dir ? showHash(e) : note("Put the cursor on a file first"); } },
     { label: "Open Preview", key: "⇧Space", run: () => { const e = state.view[state.cursor]; e && previewKind(e) ? openPreview(e) : note("Nothing to preview here"); } },
-    { label: "Share This Folder…", run: () => openShareDialog({ name: state.path === "/" ? state.info.root || "Files" : state.path.slice(state.path.lastIndexOf("/") + 1), dir: true }, state.path) },
-    ...(state.info.inbox ? [{ label: "Send Files to This Computer…", run: pickUploads }] : []),
+    ...(local ? [{ label: "Share This Folder…", run: () => openShareDialog({ name: state.path === "/" ? state.info.root || "Files" : state.path.slice(state.path.lastIndexOf("/") + 1), dir: true }, state.path) }] : []),
+    ...(state.info.inbox ? [{ label: "Send Files to This Computer…", run: pickUploads },
+      { label: "Request Files from Someone…", desc: "a link they can upload with", run: openRequestDialog }] : []),
+    { label: "Pigeon Post: Send Text to the Host…", run: () => togglePosts(true) },
+    ...(local ? [{ label: "Play Folder in a Media Player (.m3u)", desc: "VLC, mpv, Infuse…", run: () => playlist(state.path, false) },
+      { label: "Play Folder and Subfolders (.m3u)", run: () => playlist(state.path, true) }] : []),
     { label: "Preferences: Color Theme: Dark Modern", run: () => setTheme("dark", true) },
     { label: "Preferences: Color Theme: Light Modern", run: () => setTheme("light", true) },
     { label: "Preferences: Color Theme: Follow System", run: () => setTheme("auto", true) },
@@ -1392,12 +1462,16 @@ function showContextMenu(ev, i) {
   const many = state.sel.size > 1;
   const targets = targetEntries();
   const inBasket = targets.every((x) => state.basket.has(join(state.path, x.name)));
+  // Share links and playlists only reach this server's own files.
+  const local = !flockOf(state.path);
   const basket = { label: inBasket ? (many ? `Remove ${targets.length} Items from Basket` : "Remove from Basket") : (many ? `Add ${targets.length} Items to Basket` : "Add to Basket"), key: "⇧B", run: () => toggleBasket(targets) };
   const items = many
     ? [{ label: `Download ${state.sel.size} Items as ZIP`, run: downloadSelection }, basket]
     : e.dir
       ? [{ label: "Open", run: () => openEntry(e) }, { label: "Download as ZIP", run: () => downloadZip([e.name]) }, basket, "-",
-        { label: "Copy Link", run: () => copyText(entryURL(e), "link") }, { label: "Create Share Link…", run: () => openShareDialog(e, join(state.path, e.name)) }]
+        ...(local ? [{ label: "Play as Playlist (.m3u)", run: () => playlist(join(state.path, e.name), true) }] : []),
+        { label: "Copy Link", run: () => copyText(entryURL(e), "link") },
+        ...(local ? [{ label: "Create Share Link…", run: () => openShareDialog(e, join(state.path, e.name)) }] : [])]
       : [
         ...(e.archive ? [{ label: "Look Inside", key: "Enter", run: () => openEntry(e) }] : []),
         { label: "Download", run: () => downloadFile(e) },
@@ -1407,7 +1481,7 @@ function showContextMenu(ev, i) {
         { label: "Copy Link", run: () => copyText(entryURL(e), "link") },
         { label: "Copy as cURL", run: () => copyText(curlFor(e), "curl command") },
         { label: "Show SHA-256…", run: () => showHash(e) },
-        { label: "Create Share Link…", run: () => openShareDialog(e, join(state.path, e.name)) },
+        ...(local ? [{ label: "Create Share Link…", run: () => openShareDialog(e, join(state.path, e.name)) }] : []),
       ];
   items.push("-", { label: "Select All", key: `${MOD}A`, run: () => { selectRange(0, state.view.length - 1); selectionChanged(); } });
 
@@ -1695,42 +1769,81 @@ function mdURL(u, dir, inline) {
 /* share links                                                        */
 /* ------------------------------------------------------------------ */
 
+/** The dialog rows shared by share links and file requests. */
+function shareRowsHTML(request) {
+  return `
+    <label class="dlg-row">Link expires
+      <select id="sh-ttl"><option value="900">in 15 minutes</option><option value="3600" selected>in 1 hour</option>
+      <option value="86400">in 1 day</option><option value="604800">in 7 days</option><option value="0">never (while the server runs)</option></select></label>
+    <label class="dlg-row">${request ? "Files accepted" : "Downloads allowed"}
+      <select id="sh-uses">${request
+        ? `<option value="1">1</option><option value="10">10</option><option value="100">100</option><option value="0" selected>unlimited</option>`
+        : `<option value="1">1</option><option value="3" selected>3</option><option value="10">10</option><option value="0">unlimited</option>`}</select></label>
+    <label class="dlg-row">PIN <span class="dlg-hint">optional · 4–12 digits</span>
+      <input id="sh-pin" inputmode="numeric" pattern="[0-9]*" maxlength="12" autocomplete="off" placeholder="none"></label>`;
+}
+
+/** Creates a link from the dialog's fields and shows it, ready to copy. */
+async function createLink(body, name, request) {
+  const box = $("#dialog-box");
+  const pin = $("#sh-pin").value.trim();
+  if (pin && !/^[0-9]{4,12}$/.test(pin)) { note("A PIN is 4 to 12 digits", "err"); $("#sh-pin").focus(); return; }
+  try {
+    const r = await api("/api/shares", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, ttl: +$("#sh-ttl").value, uses: +$("#sh-uses").value, pin }),
+    });
+    // Prefer the address this page uses, unless it is this machine's own
+    // loopback, which nobody else can open.
+    const url = /^(localhost|127\.|\[::1\])/.test(location.hostname) && r.url.startsWith("http") ? r.url : location.origin + "/s/" + r.id;
+    const limits = [r.expires ? "expires " + fmtDate(r.expires) : "no expiry",
+      request ? (r.maxUses ? r.maxUses + " file" + (r.maxUses > 1 ? "s" : "") : "any number of files")
+        : (r.maxUses ? r.maxUses + " download" + (r.maxUses > 1 ? "s" : "") : "unlimited downloads")];
+    if (pin) limits.push("PIN " + pin);
+    box.innerHTML = `
+      <h2>${icon("i-check")}${request ? "Request ready" : "Link ready"}</h2>
+      <p class="dlg-sub">${esc(name)} · ${esc(limits.join(" · "))}</p>
+      <div class="dlg-link"><input id="sh-url" readonly value="${esc(url)}"><button class="btn primary" id="sh-copy">Copy</button></div>
+      <p class="dlg-note">${request ? `Files land in <b>${esc(r.path)}</b> on the host. ` : ""}${pin ? "Tell the PIN separately. " : ""}The host can revoke it at any time from the ${esc(state.info.name || "Pidgeon")} dashboard.</p>
+      <div class="dlg-actions"><button class="btn secondary" id="sh-done">Done</button></div>`;
+    $("#sh-url").select();
+    $("#sh-copy").onclick = () => copyText(url, request ? "request link" : "share link");
+    $("#sh-done").onclick = closeDialog;
+  } catch (err) {
+    note("Couldn't create the link: " + err.message, "err");
+  }
+}
+
 /** Shows the share dialog for an entry at path. */
 function openShareDialog(e, path) {
   const box = $("#dialog-box");
   box.innerHTML = `
     <h2>${icon("i-share")}Share ${e.dir ? "folder" : "file"}</h2>
     <p class="dlg-sub">Anyone with the link can download <b>${esc(e.name)}</b>${e.dir ? " and what's inside" : ""}. No token needed; nothing else is visible.</p>
-    <label class="dlg-row">Link expires
-      <select id="sh-ttl"><option value="900">in 15 minutes</option><option value="3600" selected>in 1 hour</option>
-      <option value="86400">in 1 day</option><option value="604800">in 7 days</option><option value="0">never (while the server runs)</option></select></label>
-    <label class="dlg-row">Downloads allowed
-      <select id="sh-uses"><option value="1">1</option><option value="3" selected>3</option><option value="10">10</option><option value="0">unlimited</option></select></label>
+    ${shareRowsHTML(false)}
     <div class="dlg-actions"><button class="btn secondary" id="sh-cancel">Cancel</button><button class="btn primary" id="sh-create">${icon("i-link")}<span>Create link</span></button></div>`;
   $("#dialog").hidden = false;
   $("#sh-ttl").focus();
   $("#sh-cancel").onclick = closeDialog;
-  $("#sh-create").onclick = async () => {
-    try {
-      const r = await api("/api/shares", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path, ttl: +$("#sh-ttl").value, uses: +$("#sh-uses").value }),
-      });
-      // Prefer the address this page uses, unless it is this machine's own
-      // loopback, which nobody else can open.
-      const url = /^(localhost|127\.|\[::1\])/.test(location.hostname) && r.url.startsWith("http") ? r.url : location.origin + "/s/" + r.id;
-      box.innerHTML = `
-        <h2>${icon("i-check")}Link ready</h2>
-        <p class="dlg-sub">${esc(e.name)} · ${r.expires ? "expires " + fmtDate(r.expires) : "no expiry"} · ${r.maxUses ? r.maxUses + " download" + (r.maxUses > 1 ? "s" : "") : "unlimited downloads"}</p>
-        <div class="dlg-link"><input id="sh-url" readonly value="${esc(url)}"><button class="btn primary" id="sh-copy">Copy</button></div>
-        <p class="dlg-note">The host can revoke it at any time from the ${esc(state.info.name || "Pidgeon")} dashboard.</p>
-        <div class="dlg-actions"><button class="btn secondary" id="sh-done">Done</button></div>`;
-      $("#sh-url").select();
-      $("#sh-copy").onclick = () => copyText(url, "share link");
-      $("#sh-done").onclick = closeDialog;
-    } catch (err) {
-      note("Couldn't create the link: " + err.message, "err");
-    }
+  $("#sh-create").onclick = () => createLink({ path }, e.name, false);
+}
+
+/** Shows the dialog for a file request: a link others upload files with. */
+function openRequestDialog() {
+  if (!state.info.inbox) return note("Uploads are off on this server", "err");
+  const box = $("#dialog-box");
+  box.innerHTML = `
+    <h2>${icon("i-upload")}Request files</h2>
+    <p class="dlg-sub">Anyone with the link can send files into a folder of the host's inbox. They see nothing else.</p>
+    <label class="dlg-row">Folder name <input id="rq-folder" maxlength="120" autocomplete="off" placeholder="Request ${esc(fmtDate(Date.now()).replace(":", ""))}"></label>
+    ${shareRowsHTML(true)}
+    <div class="dlg-actions"><button class="btn secondary" id="sh-cancel">Cancel</button><button class="btn primary" id="sh-create">${icon("i-link")}<span>Create link</span></button></div>`;
+  $("#dialog").hidden = false;
+  $("#rq-folder").focus();
+  $("#sh-cancel").onclick = closeDialog;
+  $("#sh-create").onclick = () => {
+    const folder = $("#rq-folder").value.trim();
+    createLink({ request: true, folder }, folder || "New folder", true);
   };
 }
 
@@ -1780,21 +1893,67 @@ const uploadQueue = [];
 let uploading = 0;
 const UPLOAD_PARALLEL = 2;
 
-/** Queues files to send into the host's inbox. */
-function uploadFiles(files) {
+/** Queues files to send into the host's inbox. Files the host already has
+ *  (same size and fingerprint) are marked as there and not sent. */
+async function uploadFiles(files) {
   if (!files.length) return;
   const max = state.info.inboxMax || 0;
+  const todo = [];
   // Each file gets a row in the transfers panel right away.
   for (const f of files) {
     const id = `up.${++state.seq}`;
-    const d = { id, name: f.name, kind: "upload", total: f.size, sent: 0, rate: 0, state: "queued", added: Date.now(), lastProgress: Date.now(), entry: { name: f.name } };
+    const d = { id, name: f.name, kind: "upload", total: f.size, sent: 0, rate: 0, state: "queued", checking: true, added: Date.now(), lastProgress: Date.now(), entry: { name: f.name } };
     state.downloads.set(id, d);
     if (max && f.size > max) { d.state = "failed"; d.error = `larger than the ${fmtBytes(max)} limit`; continue; }
-    uploadQueue.push([d, f]);
+    todo.push([d, f]);
   }
   togglePanel(true);
   renderDownloads();
+  const have = await alreadyOnHost(todo.map(([, f]) => f));
+  let skipped = 0;
+  for (const [i, [d, f]] of todo.entries()) {
+    d.checking = false;
+    if (have[i]) { d.state = "done"; d.dup = true; d.sent = d.total; skipped++; continue; }
+    uploadQueue.push([d, f]);
+  }
+  if (skipped) note(`${skipped} file${skipped > 1 ? "s" : ""} already on the host, not sent again`, "ok");
+  renderDownloads();
   pumpUploads();
+}
+
+/* duplicate check: CRC-32s of 64 KB at the start, middle and end of each
+   file, compared by the server with same-sized files in its inbox */
+
+const CRC_TABLE = new Uint32Array(256).map((_, n) => { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
+
+/** CRC-32 (IEEE) of a byte array, as 8 hex digits. */
+function crc32(b) {
+  let c = ~0;
+  for (let i = 0; i < b.length; i++) c = CRC_TABLE[(c ^ b[i]) & 255] ^ (c >>> 8);
+  return (~c >>> 0).toString(16).padStart(8, "0");
+}
+
+/** The quick fingerprint of a file (the same as the server's). */
+async function fingerprint(f) {
+  const K = 65536, starts = [0, Math.max(0, Math.floor(f.size / 2) - K / 2), Math.max(0, f.size - K)];
+  let out = "";
+  for (const s of starts) out += crc32(new Uint8Array(await f.slice(s, Math.min(f.size, s + K)).arrayBuffer()));
+  return out;
+}
+
+/** Asks the host which of these files its inbox already holds. Any failure
+ *  just means everything is sent (the server drops exact copies anyway). */
+async function alreadyOnHost(files) {
+  if (!files.length) return [];
+  try {
+    const fps = [];
+    for (const f of files) fps.push(await fingerprint(f));
+    const r = await api("/api/upload/check", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ files: files.map((f, i) => ({ name: f.name, size: f.size, fp: fps[i] })) }),
+    });
+    return r.have || [];
+  } catch { return []; }
 }
 
 /** Starts queued uploads, a couple at a time. */
@@ -1811,7 +1970,7 @@ function sendUpload(d, f) {
   return new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
     let lastAt = Date.now(), lastSent = 0;
-    xhr.open("PUT", "/api/upload?name=" + encodeURIComponent(f.name));
+    xhr.open("PUT", "/api/upload?name=" + encodeURIComponent(f.name) + "&mtime=" + (f.lastModified || 0));
     xhr.upload.onprogress = (ev) => {
       const now = Date.now();
       // Smooth the rate over the last moments, like the server does.
@@ -1828,10 +1987,12 @@ function sendUpload(d, f) {
     xhr.onload = () => {
       let msg = xhr.responseText.trim();
       if (xhr.status === 200) {
-        try { const r = JSON.parse(msg); d.savedAs = r.name; } catch {}
+        let dup = false;
+        try { const r = JSON.parse(msg); d.savedAs = r.name; dup = !!r.duplicate; } catch {}
         d.state = "done";
+        d.dup = dup;
         d.sent = d.total;
-        note(`Sent ${d.name}`, "ok");
+        note(dup ? `${d.name} was already on the host` : `Sent ${d.name}`, "ok");
       } else {
         d.state = "failed";
         d.error = xhr.status === 401 ? "not signed in" : msg || "upload failed";
@@ -1845,6 +2006,198 @@ function sendUpload(d, f) {
     renderDownloads();
     xhr.send(f);
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* Pigeon Post: text between this page and the host's terminal         */
+/* ------------------------------------------------------------------ */
+
+/** Fetches this device's conversation with the host. */
+async function loadPosts() {
+  try {
+    for (const m of await api("/api/post")) state.posts.set(m.id, m);
+    renderPosts();
+  } catch {}
+}
+
+/** Adds a message (sent here, or pushed by the server) and announces new
+ *  ones from the host. */
+function addPost(m) {
+  const fresh = !state.posts.has(m.id);
+  state.posts.set(m.id, m);
+  if (fresh && m.host && $("#post").hidden) {
+    state.postUnread++;
+    showPostNote(m);
+  }
+  renderPosts();
+}
+
+/** Escapes text and turns web links into links. */
+function linkify(text) {
+  return esc(text).replace(/https?:\/\/[^\s<]+/g, (u) => `<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`);
+}
+
+/** The first web link in a text, if any. */
+const firstLink = (text) => (text.match(/https?:\/\/[^\s<>"']+/) || [""])[0];
+
+/** Renders the conversation and the unread badge. */
+function renderPosts() {
+  const list = [...state.posts.values()].sort((a, b) => a.id - b.id);
+  $("#post-badge").hidden = !state.postUnread;
+  $("#post-badge").textContent = state.postUnread;
+  $("#post-list").innerHTML = list.length ? list.map((m) => `
+    <li class="msg ${m.mine ? "mine" : "host"}" data-id="${m.id}">
+      <div class="bubble">${linkify(m.text)}</div>
+      <div class="msg-meta">${m.mine ? "you" : "host"} · ${esc(fmtAgo(m.time))}<button class="link-btn msg-copy">copy</button></div>
+    </li>`).join("")
+    : `<li class="post-empty">Paste a link or a note here and it shows up in the host's terminal. Text the host sends you appears here too.</li>`;
+  const l = $("#post-list");
+  l.scrollTop = l.scrollHeight;
+}
+
+/** Shows/hides the Pigeon Post panel. */
+function togglePosts(force) {
+  const p = $("#post");
+  const show = force ?? p.hidden;
+  if (show) { togglePanel(false); toggleBasketPanel(false); }
+  p.hidden = !show;
+  $("#post-btn").classList.toggle("active", show);
+  if (show) {
+    state.postUnread = 0;
+    renderPosts();
+    $("#post-text").focus();
+  }
+}
+
+/** Sends the text box's contents to the host. */
+async function sendPost(ev) {
+  ev?.preventDefault();
+  const box = $("#post-text"), text = box.value.trim();
+  if (!text) return;
+  try {
+    const m = await api("/api/post", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+    box.value = "";
+    addPost(m);
+  } catch (err) {
+    note("Couldn't send: " + err.message, "err");
+  }
+}
+
+/** Shows a message from the host with Copy / Open / Reply. It stays until
+ *  dismissed (or for two minutes). */
+function showPostNote(m) {
+  const link = firstLink(m.text);
+  const el = document.createElement("div");
+  el.className = "note send";
+  el.innerHTML = `${icon("i-chat")}<span><b>From the host:</b> ${esc(m.text.length > 140 ? m.text.slice(0, 140) + "…" : m.text)}</span>
+    <button class="btn secondary" data-a="copy">Copy</button>
+    ${link ? `<button class="btn secondary" data-a="open">Open</button>` : ""}
+    <button class="btn primary" data-a="reply">Reply</button><button class="icon-btn" data-a="x" aria-label="Dismiss">${icon("i-x")}</button>`;
+  el.addEventListener("click", (ev) => {
+    const a = ev.target.closest("[data-a]")?.dataset.a;
+    if (a === "copy") copyText(m.text, "message");
+    if (a === "open") open(link, "_blank", "noopener");
+    if (a === "reply") togglePosts(true);
+    if (a) el.remove();
+  });
+  $("#notes").append(el);
+  setTimeout(() => el.remove(), 120_000);
+  // Flash the tab title when the page isn't in front.
+  if (document.hidden) {
+    const t = document.title;
+    document.title = "💬 " + m.text.slice(0, 40);
+    addEventListener("focus", () => { document.title = t; }, { once: true });
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* nearby servers and playlists                                       */
+/* ------------------------------------------------------------------ */
+
+/** Lists the other Pidgeon servers on the network in the sidebar. */
+async function loadNearby() {
+  if (!state.info.nearby) return;
+  try {
+    state.nearby = (await api("/api/nearby")).filter((n) => /^https?:\/\//.test(n.url));
+    // Servers the flock opens in place are known by their ID.
+    for (const n of state.nearby) if (n.path && n.id) state.flock.set(n.id, n);
+    renderNearby();
+    // A folder opened by its link before the list arrived gets its server's name.
+    if (flockOf(state.path)) renderCrumbs();
+  } catch {}
+}
+
+/** Draws the Nearby list. With the flock on, a server is a folder with its
+ *  own subtree, like the tree above; otherwise it is a link to its page. */
+function renderNearby() {
+  const list = state.nearby;
+  $("#nearby").hidden = !list.length;
+  $("#nearby-list").innerHTML = list.map((n) => {
+    const locked = n.auth && n.auth !== "open";
+    const lock = locked ? `<span class="nb-lock" aria-label="needs a token">🔒</span>` : "";
+    if (!n.path) {
+      return `<li><a class="tnode" href="${esc(n.url)}" target="_blank" rel="noopener" title="${esc(n.url)}${locked ? " · needs a token" : ""}">
+        ${icon("i-hex", "i ic-peer")}<span>${esc(n.name)}</span>${lock}</a></li>`;
+    }
+    const c = treeNode(n.path);
+    const leaf = c.dirs && c.dirs.length === 0;
+    return `<li role="treeitem" aria-expanded="${c.open}">
+      <div class="tnode${n.path === state.path ? " current" : ""}" data-path="${esc(n.path)}" title="${esc(n.name)}${locked ? " · needs a token" : ""}">
+        ${icon("i-chev", "i chev" + (c.open ? " open" : "") + (leaf ? " leaf" : ""))}
+        ${icon("i-hex", "i ic-peer")}
+        <span class="label">${esc(n.name)}</span>${lock}
+      </div>
+      ${c.open ? `<ul role="group">${treeChildren(n.path, 1)}</ul>` : ""}
+    </li>`;
+  }).join("");
+}
+
+/** Asks for the token (or user name and password) a server in the flock
+ *  wants, in place of its listing. They are kept for this browser only. */
+function showFlockLogin(err) {
+  const f = flockOf(state.path);
+  if (!f) return showEmpty("Couldn't open this folder", err.message, true);
+  const basic = err.login === "basic";
+  const st = $("#state");
+  // The server's message names the peer, even before the Nearby list has.
+  st.innerHTML = `${icon("i-hex", "i big")}<h3>${esc(err.message)}</h3>
+    <div>${basic ? "Ask whoever runs it." : "It is shown in the terminal of the computer it runs on, and is part of its QR link."}</div>
+    <form class="flock-login" id="flock-login">
+      ${basic ? `<input name="user" placeholder="user name" autocomplete="username" required><input name="pass" type="password" placeholder="password" autocomplete="current-password" required>`
+        : `<input name="token" placeholder="access token" autocomplete="off" spellcheck="false" required>`}
+      <button class="btn primary">Connect</button>
+    </form>
+    <p class="flock-err" id="flock-err"></p>`;
+  st.hidden = false;
+  const form = $("#flock-login");
+  $("input", form).focus();
+  form.onsubmit = async (ev) => {
+    ev.preventDefault();
+    try {
+      await api("/api/flock/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: f.id, ...Object.fromEntries(new FormData(form)) }),
+      });
+    } catch (e2) {
+      $("#flock-err").textContent = e2.message;
+      return;
+    }
+    note(`Connected to ${peerName(f.id)}`, "ok");
+    // What failed without the token is worth asking again.
+    for (const m of [state.tree, state.peek, state.cache]) for (const p of [...m.keys()]) if (p.startsWith(f.root)) m.delete(p);
+    load(state.path, { force: true });
+  };
+}
+
+/** Downloads a folder's videos and music as an .m3u playlist that media
+ *  players stream straight from this server. */
+function playlist(path, recursive) {
+  const a = Object.assign(document.createElement("a"), { href: "/api/m3u?path=" + encodeURIComponent(path) + (recursive ? "&r=1" : ""), download: "" });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  note("Open the playlist with VLC, mpv or another player to stream the folder");
 }
 
 /* ------------------------------------------------------------------ */
@@ -1925,7 +2278,7 @@ function renderBasket() {
   $("#bk-list").innerHTML = [...state.basket.values()].map((b) => `<li class="bk" data-p="${esc(b.path)}">
       ${fileIcon(b).html}
       <span class="bk-name" title="${esc(b.path)}">${esc(b.name)}</span>
-      <span class="bk-where">${esc(parentOf(b.path) === "/" ? state.info.root || "/" : parentOf(b.path).slice(1))}${b.dir ? "" : " · " + fmtBytes(b.size)}</span>
+      <span class="bk-where">${esc(placeName(parentOf(b.path)))}${b.dir ? "" : " · " + fmtBytes(b.size)}</span>
       <button class="icon-btn bk-x" title="Remove from basket" aria-label="Remove ${esc(b.name)} from basket">${icon("i-x")}</button>
     </li>`).join("");
 }
@@ -1934,7 +2287,7 @@ function renderBasket() {
 function toggleBasketPanel(force) {
   const p = $("#basket");
   const show = force ?? p.hidden;
-  if (show) togglePanel(false);
+  if (show) { togglePanel(false); togglePosts(false); }
   p.hidden = !show;
   if (show) renderBasket();
 }
@@ -2095,6 +2448,7 @@ function wire() {
     return e && join(state.path, e.name);
   }));
   $("#tree").addEventListener("pointerover", hoverPrefetch(".tnode", (node) => node.dataset.path));
+  $("#nearby-list").addEventListener("pointerover", hoverPrefetch(".tnode", (node) => node.dataset.path));
 
   // Checkbox clicks toggle selection without moving to other rows.
   list.addEventListener("change", (ev) => {
@@ -2221,9 +2575,11 @@ function wire() {
 
   // Explorer tree: chevron toggles, label navigates. Clicking the folder
   // that is already open in the file list collapses or expands it instead.
-  $("#tree").addEventListener("click", (ev) => {
+  // Servers in the Nearby list that open in place work the same way; the
+  // others are plain links.
+  const treeClick = (ev) => {
     const node = ev.target.closest(".tnode");
-    if (!node) return;
+    if (!node?.dataset.path) return;
     const p = node.dataset.path, n = treeNode(p);
     if (ev.target.closest(".chev") || p === state.path) {
       n.open = !n.open;
@@ -2233,7 +2589,9 @@ function wire() {
     }
     n.open = true;
     go(p);
-  });
+  };
+  $("#tree").addEventListener("click", treeClick);
+  $("#nearby-list").addEventListener("click", treeClick);
   $("#tree-root").addEventListener("click", () => go("/"));
   $("#collapse-all").addEventListener("click", () => {
     for (const [p, n] of state.tree) if (p !== "/") n.open = false;
@@ -2362,6 +2720,20 @@ function wire() {
     uploadFiles([...ev.dataTransfer.files]);
   });
 
+  // Pigeon Post: the panel, its form (Enter sends, Shift+Enter breaks the
+  // line) and the copy buttons on messages.
+  $("#post-btn").addEventListener("click", () => togglePosts());
+  $("#post-close").addEventListener("click", () => togglePosts(false));
+  $("#post-form").addEventListener("submit", sendPost);
+  $("#post-text").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) sendPost(ev);
+    if (ev.key === "Escape") togglePosts(false);
+  });
+  $("#post-list").addEventListener("click", (ev) => {
+    const li = ev.target.closest(".msg");
+    if (li && ev.target.closest(".msg-copy")) copyText(state.posts.get(+li.dataset.id)?.text || "", "message");
+  });
+
   // The session-limit countdown in the status bar.
   setInterval(renderLimits, 1000);
 
@@ -2394,6 +2766,10 @@ async function main() {
       : $("#dl-empty").textContent;
     renderLimits();
     renderBasket();
+    loadPosts();
+    loadNearby();
+    setInterval(loadNearby, 60_000);
+    if (state.info.tv) $("#sb-auth").textContent += " · 📺 TV";
     // The grid was drawn before the server said whether it makes thumbnails.
     if (state.info.thumbs && state.layout === "grid") renderWindow(true);
   } catch {}

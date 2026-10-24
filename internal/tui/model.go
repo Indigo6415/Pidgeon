@@ -38,6 +38,10 @@ type Options struct {
 	Server  *server.Server    // share links, sending files, the file picker; optional
 	Devices *devices.Registry // the Devices panel and --ask approvals; optional
 	Limits  Limits            // shown as a countdown / budget in the header
+
+	Fingerprint string // HTTPS certificate SHA-256 (hex); "" = plain HTTP
+	MDNSName    string // name the server is announced under on the network
+	TVName      string // TV mode's name; "" = off
 }
 
 // Limits are the conditions under which the session ends by itself.
@@ -177,6 +181,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.dash.refresh()
 		return m, dashTick()
+
+	case tea.PasteMsg:
+		// Pasted text goes into an open text field (a message, a PIN).
+		if m.phase == phaseDash {
+			m.dash.paste(msg.Content)
+		}
+		return m, nil
 
 	case tea.KeyPressMsg:
 		// Any key skips the splash; ctrl+c still quits immediately.

@@ -110,6 +110,10 @@ func TestCursorFlowsThroughDevicesAndCreatesShares(t *testing.T) {
 		t.Fatalf("picking a file should ask for the expiry, got %+v", d.menu)
 	}
 	press(d, tea.KeyEnter, tea.KeyEnter) // 1 hour, 1 download
+	if d.menu == nil || d.menu.title != "PIN" {
+		t.Fatalf("then it should ask about a PIN, got %+v", d.menu)
+	}
+	press(d, tea.KeyEnter) // no PIN
 	sh := srv.Shares()
 	if len(sh) != 1 || sh[0].Path != "/a.txt" || sh[0].MaxUses != 1 || sh[0].Expires.IsZero() {
 		t.Fatalf("shares = %+v", sh)
@@ -143,3 +147,96 @@ func TestNicknames(t *testing.T) {
 		}
 	}
 }
+
+// typeText types s into the dashboard key by key, as a terminal would.
+func typeText(d *dashboard, s string) {
+	for _, r := range s {
+		d.handleKey(tea.KeyPressMsg{Code: r, Text: string(r)})
+	}
+}
+
+// TestFileRequestWithRandomPIN: the main menu's "Request files…" names a
+// folder, then makes an upload link with a PIN shown in the dashboard.
+func TestFileRequestWithRandomPIN(t *testing.T) {
+	d, _, _ := newPeopleDash(t, false)
+	// Without an inbox there is nothing to request into.
+	d.startRequest()
+	if d.input != nil {
+		t.Fatal("no inbox: no file request")
+	}
+	d2, _, srv2 := newRequestDash(t)
+	d2.startRequest()
+	if d2.input == nil {
+		t.Fatal("expected the folder name field")
+	}
+	typeText(d2, "Holiday pics")
+	press(d2, tea.KeyEnter)               // folder name
+	press(d2, tea.KeyEnter, tea.KeyEnter) // 1 hour, unlimited files
+	press(d2, tea.KeyDown, tea.KeyEnter)  // random 4-digit PIN
+	sh := srv2.Shares()
+	if len(sh) != 1 || !sh[0].Request || sh[0].Name != "Holiday pics" || len(sh[0].PIN) != 4 {
+		t.Fatalf("shares = %+v", sh)
+	}
+	if out := d2.view(120, 40); !strings.Contains(out, "⇣") || !strings.Contains(out, "PIN") {
+		t.Fatal("the request should show in the share panel with its PIN")
+	}
+}
+
+// newRequestDash is newPeopleDash with an inbox.
+func newRequestDash(t *testing.T) (*dashboard, *devices.Registry, *server.Server) {
+	t.Helper()
+	dir := t.TempDir()
+	st := stats.New()
+	reg := devices.New(false, "")
+	srv, err := server.New(server.Config{Dir: dir, Inbox: filepath.Join(dir, "Inbox"), Store: st, Devices: reg, Assets: fstest.MapFS{"index.html": {Data: []byte("x")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	lo := listeners.Candidate{ID: "127.0.0.1", Addr: netip.MustParseAddr("127.0.0.1"), Kind: listeners.KindLoopback}
+	mgr := listeners.NewManager([]listeners.Candidate{lo}, http.NotFoundHandler(), 18790, st)
+	if _, err := mgr.Start([]string{lo.ID}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { mgr.Shutdown(context.Background()) })
+	return newDashboard(Options{Store: st, Manager: mgr, Dir: dir, AuthMode: "open", Server: srv, Devices: reg}), reg, srv
+}
+
+// TestPigeonPostPopsUpAndReplies: a message from a device pops up; "r"
+// opens a reply field that takes typing and paste, and enter sends it.
+func TestPigeonPostPopsUpAndReplies(t *testing.T) {
+	d, reg, srv := newPeopleDash(t, false)
+	reg.Admit(context.Background(), "10.0.0.7", "Mozilla/5.0 (iPhone) Safari/604.1", 0)
+	req, _ := http.NewRequest("POST", "/api/post", strings.NewReader(`{"text":"see https://example.com/x please"}`))
+	req.RemoteAddr = "10.0.0.7:5555"
+	w := &discard{h: http.Header{}}
+	srv.ServeHTTP(w, req)
+	d.refresh()
+	if d.menu == nil || !strings.HasPrefix(d.menu.title, "Message from iPhone") {
+		t.Fatalf("expected the message to pop up, got %+v", d.menu)
+	}
+	if _, ok := d.menu.shortcut("o"); !ok {
+		t.Fatal("a message with a link offers to open it")
+	}
+	press(d, 'r')
+	if d.input == nil {
+		t.Fatal("r should open the reply field")
+	}
+	typeText(d, "on it")
+	d.paste(" — thanks\n!")
+	press(d, tea.KeyEnter)
+	msgs := srv.Messages()
+	if len(msgs) != 2 || msgs[1].To != "10.0.0.7" || msgs[1].Text != "on it — thanks !" {
+		t.Fatalf("messages = %+v", msgs)
+	}
+}
+
+// discard is a minimal ResponseWriter for driving the server directly.
+type discard struct {
+	h    http.Header
+	code int
+}
+
+func (w *discard) Header() http.Header         { return w.h }
+func (w *discard) Write(b []byte) (int, error) { return len(b), nil }
+func (w *discard) WriteHeader(c int)           { w.code = c }

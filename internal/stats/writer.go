@@ -3,6 +3,7 @@ package stats
 import (
 	"context"
 	"errors"
+	"hash"
 	"io"
 	"net/http"
 	"strconv"
@@ -58,6 +59,7 @@ type CountingWriter struct {
 	http.ResponseWriter
 	T           *Transfer
 	Ctx         context.Context // the request's context: ends a pause or a wait when the client leaves
+	Hash        hash.Hash       // optional: every byte sent is also hashed (for delivery receipts)
 	wroteHeader bool
 	Status      int
 }
@@ -95,6 +97,7 @@ func (w *CountingWriter) Write(p []byte) (int, error) {
 	if !w.T.limited() {
 		n, err := w.ResponseWriter.Write(p)
 		w.T.Add(n)
+		w.hash(p[:n])
 		return n, err
 	}
 	// Paused or capped: send in small paced pieces so the rate is smooth
@@ -110,12 +113,20 @@ func (w *CountingWriter) Write(p []byte) (int, error) {
 		}
 		n, err := w.ResponseWriter.Write(p[written : written+size])
 		w.T.Add(n)
+		w.hash(p[written : written+n])
 		written += n
 		if err != nil {
 			return written, err
 		}
 	}
 	return written, nil
+}
+
+// hash feeds bytes that reached the client into the optional hash.
+func (w *CountingWriter) hash(b []byte) {
+	if w.Hash != nil {
+		w.Hash.Write(b)
+	}
 }
 
 // Flush forwards to the underlying writer.

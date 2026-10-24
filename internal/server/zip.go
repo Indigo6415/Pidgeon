@@ -73,6 +73,9 @@ type zipJob struct {
 	flat    bool     // each selected item sits at the top of the archive
 	sums    bool     // the archive ends with a SHA256SUMS file
 
+	creds map[string]flockCreds  // the visitor's credentials for the peers its flock items are on
+	lists map[string]flockListed // while planning: folders on peers already listed, by peer ID + path
+
 	mu sync.Mutex // guards the CRC cache in items
 }
 
@@ -82,6 +85,8 @@ type zipOptions struct {
 	Flat  bool   // put every selected item at the top level instead of keeping its path
 	Sums  bool   // add a SHA256SUMS file listing every file's hash
 	Name  string // archive name without ".zip"; "" picks one from the selection
+
+	Creds map[string]flockCreds // the visitor's credentials for the peers in the selection
 }
 
 // zipRequest is the /api/zip request body.
@@ -102,7 +107,7 @@ func (s *Server) handleZipCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	base, err := s.resolve(req.Base)
+	base, err := s.resolveIn(r, req.Base)
 	if err != nil {
 		httpError(w, err)
 		return
@@ -110,8 +115,9 @@ func (s *Server) handleZipCreate(w http.ResponseWriter, r *http.Request) {
 	var names []string
 	seen := map[string]bool{}
 	// Validate every selected path: it must exist and live under base.
+	// Items on other servers are checked while the archive is planned.
 	for _, p := range req.Paths {
-		name, err := s.resolve(path.Join("/", base, p))
+		name, err := s.resolveIn(r, path.Join("/", base, p))
 		if err != nil {
 			httpError(w, err)
 			return
@@ -120,7 +126,9 @@ func (s *Server) handleZipCreate(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "selection outside folder", http.StatusBadRequest)
 			return
 		}
-		if _, err := s.stat(name); err != nil {
+		if _, _, remote := splitFlock(name); remote {
+			// Checked against the peer's listings when planned.
+		} else if _, err := s.stat(name); err != nil {
 			// Name the missing item: a basket can outlive the files in it.
 			if errors.Is(err, fs.ErrNotExist) {
 				http.Error(w, "not found: /"+name, http.StatusNotFound)
@@ -136,9 +144,15 @@ func (s *Server) handleZipCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	names = dropNested(names)
-	opt := zipOptions{Store: req.Store, Flat: req.Flat, Sums: req.Sums, Name: req.Name}
+	opt := zipOptions{Store: req.Store, Flat: req.Flat, Sums: req.Sums, Name: req.Name, Creds: zipCreds(r, names)}
 	job, err := s.newZipJob(r.Context(), base, names, opt)
 	if err != nil {
+		// A peer that is gone or wants a token is worth naming.
+		var fe *flockError
+		if errors.As(err, &fe) {
+			writeFlockError(w, err)
+			return
+		}
 		http.Error(w, "couldn't prepare the archive", http.StatusInternalServerError)
 		return
 	}
@@ -175,12 +189,15 @@ func dropNested(names []string) []string {
 // The archive is stored (exact size, resumable) when opt.Store is set or
 // when every file is already compressed and deflate would gain nothing.
 func (s *Server) newZipJob(ctx context.Context, base string, names []string, opt zipOptions) (*zipJob, error) {
-	job := &zipJob{base: base, names: names, created: time.Now(), size: -1, flat: opt.Flat, sums: opt.Sums}
+	job := &zipJob{base: base, names: names, created: time.Now(), size: -1, flat: opt.Flat, sums: opt.Sums,
+		creds: opt.Creds, lists: map[string]flockListed{}}
 	job.file = s.zipName(job)
 	if n := safeArchiveName(opt.Name); n != "" {
 		job.file = n + ".zip"
 	}
-	if err := s.planZip(ctx, job); err != nil {
+	err := s.planZip(ctx, job)
+	job.lists = nil // only needed while planning
+	if err != nil {
 		return nil, err
 	}
 	job.store = opt.Store
@@ -269,10 +286,21 @@ func (s *Server) planZip(ctx context.Context, job *zipJob) error {
 	used := map[string]bool{}
 	// Walk each selected item in turn.
 	for _, top := range job.names {
-		rename := func(p string) string { return relTo(job.base, p) }
+		rename := func(p string) string { return s.zipRel(job.base, p) }
 		if job.flat {
-			short := uniqueIn(used, path.Base(top))
+			short := uniqueIn(used, path.Base(s.zipRel(".", top)))
 			rename = func(p string) string { return short + strings.TrimPrefix(p, top) }
+		}
+		// Items on other servers come from their listings. One that has
+		// gone is noted; a peer that is gone or wants a token fails the plan.
+		if id, inner, ok := splitFlock(top); ok {
+			if err := s.planFlock(ctx, job, top, id, inner, rename); err != nil {
+				if ctx.Err() != nil || !errors.Is(err, fs.ErrNotExist) {
+					return err
+				}
+				job.skipped = append(job.skipped, top+": not found")
+			}
+			continue
 		}
 		// Items inside an archive come from its index.
 		if arc, inner, ok := s.splitArchive(top); ok && inner != "" {
@@ -482,6 +510,10 @@ func (s *Server) serveZip(w http.ResponseWriter, r *http.Request, job *zipJob, t
 	})
 	cw := stats.NewCountingWriter(w, t)
 	cw.Ctx = r.Context()
+	// A whole archive is hashed on its way out, for its receipt.
+	if status == http.StatusOK {
+		cw.Hash = sha256.New()
+	}
 	cw.WriteHeader(status)
 
 	var err error
@@ -507,6 +539,9 @@ func (s *Server) serveZip(w http.ResponseWriter, r *http.Request, job *zipJob, t
 		outcome = stats.PartialDone
 	}
 	s.cfg.Store.End(t, outcome)
+	if outcome == stats.Completed {
+		s.recordZip(r, t, cw, display)
+	}
 }
 
 // writeStoredZip writes a stored archive from the plan. Every file entry is
@@ -576,7 +611,7 @@ func (s *Server) writeStoredZip(ctx context.Context, out io.Writer, t *stats.Tra
 			}
 		default:
 			var sum [32]byte
-			crc, sum, err = s.copyStored(fw, it, buf, t, job.sums)
+			crc, sum, err = s.copyStored(ctx, fw, job, it, buf, t)
 			if err == nil {
 				job.mu.Lock()
 				it.crc, it.crcOK = crc, true
@@ -597,22 +632,19 @@ func (s *Server) writeStoredZip(ctx context.Context, out io.Writer, t *stats.Tra
 }
 
 // copyStored copies exactly it.size bytes of a file into w and returns their
-// CRC-32 (and SHA-256 when withSum). A file that shrank since it was planned
-// can't fill its entry and fails the archive; one that grew is cut at the
-// planned size, and the transfer is flagged as having changed.
-func (s *Server) copyStored(w io.Writer, it *zipItem, buf []byte, t *stats.Transfer, withSum bool) (crc uint32, sum [32]byte, err error) {
-	f, _, err := s.openFile(it.src)
+// CRC-32 (and SHA-256 when the archive lists them). A file that shrank since
+// it was planned can't fill its entry and fails the archive; one that grew
+// is cut at the planned size, and the transfer is flagged as having changed.
+func (s *Server) copyStored(ctx context.Context, w io.Writer, job *zipJob, it *zipItem, buf []byte, t *stats.Transfer) (crc uint32, sum [32]byte, err error) {
+	f, err := s.openItem(ctx, job, it.src)
 	if err != nil {
 		return 0, sum, err
-	}
-	if f == nil {
-		return 0, sum, errNotDir
 	}
 	defer f.Close()
 	c := crc32.NewIEEE()
 	dst := io.MultiWriter(w, c)
 	h := sha256.New()
-	if withSum {
+	if job.sums {
 		dst = io.MultiWriter(w, c, h)
 	}
 	n, err := io.CopyBuffer(dst, io.LimitReader(onlyReader{f}, it.size), buf)
@@ -657,11 +689,8 @@ func (s *Server) writeDeflateZip(ctx context.Context, w io.Writer, t *stats.Tran
 			}
 			continue
 		}
-		f, _, err := s.openFile(it.src)
 		// Open before writing the header so an unreadable file is just skipped.
-		if err == nil && f == nil {
-			err = errNotDir
-		}
+		f, err := s.openItem(ctx, job, it.src)
 		if err != nil {
 			skipped = append(skipped, it.src+": "+err.Error())
 			continue

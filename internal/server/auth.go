@@ -27,8 +27,9 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// A share link is its own credential, scoped to one file or folder.
-		if strings.HasPrefix(r.URL.Path, "/s/") {
+		// A share link is its own credential, scoped to one file or folder;
+		// TV mode's endpoints check their own key (TVs can't log in).
+		if strings.HasPrefix(r.URL.Path, "/s/") || strings.HasPrefix(r.URL.Path, "/dlna/") {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -41,6 +42,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 					Path:     "/",
 					HttpOnly: true,
 					SameSite: http.SameSiteLaxMode,
+					Secure:   r.TLS != nil,
 					MaxAge:   30 * 24 * 3600,
 				})
 				// Strip the token from the address bar for the app page so it

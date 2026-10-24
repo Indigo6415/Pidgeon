@@ -6,6 +6,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"html"
@@ -36,9 +37,10 @@ type Config struct {
 	Store      *stats.Store
 	Assets     fs.FS // web UI assets (index.html, app.js, app.css, ...)
 
-	Devices  *devices.Registry // device list and --ask gate; nil admits everyone
-	Inbox    string            // directory uploads are written to; "" disables uploads
-	InboxMax int64             // largest accepted upload in bytes; 0 = no limit
+	Devices   *devices.Registry // device list and --ask gate; nil admits everyone
+	Inbox     string            // directory uploads are written to; "" disables uploads
+	InboxMax  int64             // largest accepted upload in bytes; 0 = no limit
+	InboxSort string            // "date": file uploads into YYYY/MM folders by capture date
 
 	// Session limits, enforced by the app; the server refuses new downloads
 	// once MaxBytes have been served and reports the limits to the web UI.
@@ -52,6 +54,39 @@ type Config struct {
 
 	NoThumbs bool   // don't generate image thumbnails for the grid view
 	ThumbDir string // where thumbnails are cached; "" picks the user cache dir
+
+	TV     bool   // also act as a DLNA media server for TVs (see dlna.go)
+	TVName string // the name TVs show; "" = "Pidgeon · <folder>"
+	// TVSecretFile keeps TV mode's secret between runs, so TVs that
+	// remember the server still find it after a restart; "" = new each run.
+	TVSecretFile string
+
+	// Nearby finds other Pidgeon servers on the network (mDNS), for the web
+	// UI's "Nearby" list. Optional.
+	Nearby func(ctx context.Context) []NearbyServer
+	// Flock lets visitors browse the Nearby servers through this one, as
+	// folders under /.flock/<peer>/ (see flock.go). Needs Nearby.
+	Flock bool
+
+	// OnPost is called for each Pigeon Post message a device sends the
+	// host (headless mode prints them). Optional.
+	OnPost func(Message)
+}
+
+// NearbyServer is another Pidgeon server found on the network.
+type NearbyServer struct {
+	Name    string `json:"name"`
+	URL     string `json:"url"`
+	Auth    string `json:"auth"` // "open", "token", "basic"
+	TLS     bool   `json:"tls,omitempty"`
+	Version string `json:"version,omitempty"`
+	ID      string `json:"id,omitempty"`   // its mDNS ID
+	Path    string `json:"path,omitempty"` // where it opens in the flock ("/.flock/<id>"); "" = only as a link
+
+	// Proxy is the address the flock relays to ("http(s)://ip:port"), the
+	// one the server's own answer came from; "" = not relayable.
+	Proxy       string `json:"-"`
+	Fingerprint string `json:"-"` // its HTTPS certificate's SHA-256, as announced
 }
 
 // Server is the http.Handler shared by every listener.
@@ -74,9 +109,14 @@ type Server struct {
 	inboxRel  string   // inbox as a root-relative folder ("." or "a/b") when it is browsable, else ""
 	uploadMu  sync.Mutex
 	uploading map[string]bool // inbox names reserved by uploads in progress
+	inboxSeen *inboxCache     // fingerprints and hashes of inbox files, for duplicates
 
 	hubMu sync.Mutex
 	subs  map[*subscriber]struct{} // open event streams
+
+	postMu  sync.Mutex
+	posts   []Message // Pigeon Post, oldest first
+	postSeq uint64
 
 	arcMu       sync.Mutex
 	arcs        map[string]*arcIndex // archive tables of contents, by root-relative path
@@ -84,6 +124,16 @@ type Server struct {
 
 	thumbs *thumbCache // nil when thumbnails are off
 	hashes *hashCache
+
+	dlnaKey  string // secret path segment of the DLNA endpoints; "" = TV mode off
+	dlnaUUID string // UPnP device ID
+
+	nearbyMu   sync.Mutex
+	nearby     []NearbyServer // last scan of the network
+	nearbyWhen time.Time      // when it ran
+
+	flockMu    sync.Mutex
+	flockPeers map[string]*flockPeer // peers the flock can relay to, by mDNS ID
 
 	done      chan struct{} // closed by Close to end long-lived SSE streams
 	closeOnce sync.Once
@@ -132,12 +182,14 @@ func New(cfg Config) (*Server, error) {
 		shareZips: map[string]string{},
 		shares:    map[string]*share{},
 		uploading: map[string]bool{},
+		inboxSeen: newInboxCache(),
 		subs:      map[*subscriber]struct{}{},
 		done:      make(chan struct{}),
 
 		arcs:        map[string]*arcIndex{},
 		arcBuilding: map[string]*arcBuild{},
 		hashes:      newHashCache(),
+		flockPeers:  map[string]*flockPeer{},
 	}
 	if !cfg.NoThumbs {
 		s.thumbs = newThumbCache(cfg.ThumbDir)
@@ -165,9 +217,21 @@ func New(cfg Config) (*Server, error) {
 	mux.HandleFunc("POST /api/shares", s.handleShareCreate)
 	mux.HandleFunc("GET /s/{id}", s.handleShare)
 	mux.HandleFunc("GET /s/{id}/{rest...}", s.handleShare)
+	mux.HandleFunc("POST /s/{id}", s.handleSharePIN)
+	mux.HandleFunc("PUT /s/{id}/upload", s.handleShareUpload)
+	mux.HandleFunc("POST /s/{id}/check", s.handleShareCheck)
 	mux.HandleFunc("PUT /api/upload", s.handleUpload)
+	mux.HandleFunc("POST /api/upload/check", s.handleUploadCheck)
 	mux.HandleFunc("GET /api/thumb", s.handleThumb)
 	mux.HandleFunc("GET /api/hash", s.handleHash)
+	mux.HandleFunc("GET /api/post", s.handlePostList)
+	mux.HandleFunc("POST /api/post", s.handlePostSend)
+	mux.HandleFunc("GET /api/m3u", s.handleM3U)
+	mux.HandleFunc("GET /api/nearby", s.handleNearby)
+	mux.HandleFunc("POST /api/flock/login", s.handleFlockLogin)
+	if cfg.TV {
+		s.setupDLNA(mux)
+	}
 
 	// Order matters: instrument is outermost so rejected (401) requests are
 	// still counted and logged; the device gate sits inside auth so only
@@ -183,6 +247,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.handler.S
 // Dir returns the absolute directory being served (the first one, when
 // several paths are served).
 func (s *Server) Dir() string { return s.cfg.Dir }
+
+// Name is the display name of what is served (the folder's name).
+func (s *Server) Name() string { return s.name }
 
 // Paths returns every absolute path being served, in order.
 func (s *Server) Paths() []string { return s.root.Paths() }
@@ -313,11 +380,33 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 // resolve converts a URL-style path ("/a/b", "a/b", "") into a name relative
 // to the served root ("a/b" or "."). Traversal is neutralised by path.Clean
 // here and enforced again by os.Root, which also rejects symlink escapes.
-func (s *Server) resolve(p string) (string, error) {
+// Paths into the flock are refused: see resolveIn.
+func (s *Server) resolve(p string) (string, error) { return s.resolvePath(p, false) }
+
+// resolveIn is resolve for the handlers that can reach the flock: a path
+// on another server (/.flock/<peer>/...) is accepted too, unless r was
+// itself relayed by a flock, so requests never travel more than one hop.
+func (s *Server) resolveIn(r *http.Request, p string) (string, error) {
+	return s.resolvePath(p, r.Header.Get(flockHeader) == "")
+}
+
+// resolvePath is resolve, accepting paths into the flock when flock is set.
+func (s *Server) resolvePath(p string, flock bool) (string, error) {
 	clean := path.Clean("/" + strings.ReplaceAll(p, "\\", "/"))
 	name := strings.TrimPrefix(clean, "/")
 	if name == "" {
 		return ".", nil
+	}
+	// The flock's paths belong to other servers, whose own rules apply
+	// there. A real ".flock" folder at the top is out of reach meanwhile.
+	if s.cfg.Flock && inFlock(name) {
+		if _, _, ok := splitFlock(name); !ok || !flock {
+			return "", errHidden
+		}
+		if !fs.ValidPath(name) {
+			return "", fs.ErrInvalid
+		}
+		return name, nil
 	}
 	// Refuse dotfile segments unless explicitly allowed. The top-level
 	// names of a multi-root tree were chosen on the command line, so they
@@ -353,8 +442,12 @@ func isHiddenName(n string) bool { return strings.HasPrefix(n, ".") }
 
 // hidden reports whether entry n of root-relative folder dir is left out
 // of listings: dotfiles are, unless --hidden, except for the top-level
-// names of a multi-root tree.
+// names of a multi-root tree. With the flock on, a real top-level ".flock"
+// is always hidden: that name is the flock's.
 func (s *Server) hidden(dir, n string) bool {
+	if dir == "." && n == flockDir && s.cfg.Flock {
+		return true
+	}
 	return !s.cfg.ShowHidden && isHiddenName(n) && !(dir == "." && s.root.isMount(n))
 }
 

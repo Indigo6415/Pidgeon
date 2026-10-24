@@ -16,6 +16,7 @@ import (
 	"io/fs"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -110,13 +111,18 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	name, err := s.resolve(q.Get("path"))
+	name, err := s.resolveIn(r, q.Get("path"))
 	if err != nil {
 		httpError(w, err)
 		return
 	}
 	if !thumbExts[strings.ToLower(path.Ext(name))] {
 		http.Error(w, "not an image", http.StatusUnsupportedMediaType)
+		return
+	}
+	// An image on another server gets that server's thumbnail.
+	if id, inner, ok := splitFlock(name); ok {
+		s.flockRelay(w, r, id, "/api/thumb?"+url.Values{"path": {inner}, "w": {q.Get("w")}, "v": {q.Get("v")}}.Encode())
 		return
 	}
 	width := thumbWidth(q.Get("w"))

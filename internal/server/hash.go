@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"sync"
 )
 
@@ -45,9 +46,14 @@ func hashKey(name string, fi fs.FileInfo) string {
 // handleHash returns the SHA-256 of one file (?path=/a/b.iso), also for
 // files inside archives: {"sha256": "...", "size": n, "mtime": ms}.
 func (s *Server) handleHash(w http.ResponseWriter, r *http.Request) {
-	name, err := s.resolve(r.URL.Query().Get("path"))
+	name, err := s.resolveIn(r, r.URL.Query().Get("path"))
 	if err != nil {
 		httpError(w, err)
+		return
+	}
+	// A file on another server is hashed there, without moving its bytes.
+	if id, inner, ok := splitFlock(name); ok {
+		s.flockRelay(w, r, id, "/api/hash?path="+url.QueryEscape(inner))
 		return
 	}
 	sum, fi, err := s.hashFile(r.Context(), name)

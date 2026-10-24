@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/sha256"
 	"io/fs"
 	"mime"
 	"net/http"
@@ -22,9 +23,14 @@ var dlIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}\.[0-9]{1,10}$`)
 // requests and single/multi Range support, reading through the *os.File so
 // the file is never loaded into memory.
 func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
-	name, err := s.resolve(r.PathValue("path"))
+	name, err := s.resolveIn(r, r.PathValue("path"))
 	if err != nil {
 		httpError(w, err)
+		return
+	}
+	// A file on another server is relayed from there.
+	if id, inner, ok := splitFlock(name); ok {
+		s.flockFile(w, r, name, id, inner)
 		return
 	}
 	s.serveFile(w, r, name, "")
@@ -87,6 +93,10 @@ func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, name, share s
 	})
 	cw := stats.NewCountingWriter(w, t)
 	cw.Ctx = r.Context()
+	// A whole-file download is hashed on its way out, for its receipt.
+	if !inline && r.Header.Get("Range") == "" {
+		cw.Hash = sha256.New()
+	}
 	http.ServeContent(cw, r, fi.Name(), fi.ModTime(), f)
 	// A file that changed (or was replaced) while it was being sent may
 	// have reached the client in an inconsistent state: flag it.
@@ -95,7 +105,12 @@ func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, name, share s
 			t.MarkChanged()
 		}
 	}
-	s.cfg.Store.End(t, fileOutcome(cw, t, fi.Size()))
+	outcome := fileOutcome(cw, t, fi.Size())
+	s.cfg.Store.End(t, outcome)
+	// Whole deliveries (not previews) get a receipt.
+	if outcome == stats.Completed && !inline {
+		s.recordFile(r, t, cw, name, fi)
+	}
 }
 
 // replaced reports whether the path now names a different version of the

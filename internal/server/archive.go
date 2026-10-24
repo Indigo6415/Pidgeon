@@ -96,7 +96,8 @@ var errNotArchive = errors.New("not a readable archive")
 // itself, inner is "". Folders that merely look like archives by name are
 // skipped, and archives inside archives are treated as plain files.
 func (s *Server) splitArchive(name string) (arc, inner string, ok bool) {
-	if name == "." {
+	// Archives on other servers are read by those servers.
+	if name == "." || (s.cfg.Flock && inFlock(name)) {
 		return "", "", false
 	}
 	segs := strings.Split(name, "/")
