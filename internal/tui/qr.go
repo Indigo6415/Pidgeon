@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"image/color"
 	"strings"
 
 	"charm.land/lipgloss/v2"
@@ -21,6 +22,13 @@ type qrBlock struct {
 // renderQR encodes text and draws it with half-block characters, packing
 // two module rows into each terminal row. Colours are forced to black on
 // white so the code scans regardless of the terminal theme.
+//
+// Terminals with extra line spacing (Ghostty's adjust-cell-height, for
+// one) draw block glyphs shorter than the cell, leaving a strip at the top
+// that only the cell background covers. Solid cells are therefore drawn as
+// background-coloured spaces, and mixed cells always as '▄' on the top
+// half's colour, so the strip continues the top module in every column and
+// module edges line up across the code instead of showing seams or steps.
 func renderQR(text string) (qrBlock, bool) {
 	code, err := qr.Encode(text, qr.L)
 	if err != nil {
@@ -35,25 +43,31 @@ func renderQR(text string) (qrBlock, bool) {
 		}
 		return code.Black(x, y)
 	}
-	st := lipgloss.NewStyle().Foreground(hex("#000000")).Background(hex("#ffffff"))
+	black, white := hex("#000000"), hex("#ffffff")
+	col := func(d bool) color.Color {
+		// Dark modules are black, everything else is white.
+		if d {
+			return black
+		}
+		return white
+	}
 	b := qrBlock{text: text, w: n}
 	// Each output row covers module rows y (top half) and y+1 (bottom half).
 	for y := 0; y < n; y += 2 {
 		var sb strings.Builder
 		for x := range n {
 			top, bot := dark(x, y), dark(x, y+1)
-			switch {
-			case top && bot:
-				sb.WriteRune('█')
-			case top:
-				sb.WriteRune('▀')
-			case bot:
-				sb.WriteRune('▄')
-			default:
-				sb.WriteRune(' ')
+			// Solid cells: a space on the matching background fills the
+			// whole cell, line spacing included.
+			if top == bot {
+				sb.WriteString(lipgloss.NewStyle().Background(col(top)).Render(" "))
+				continue
 			}
+			// Mixed cells: the background (top colour) also fills the strip
+			// above the glyph, which belongs to the top module anyway.
+			sb.WriteString(lipgloss.NewStyle().Foreground(col(bot)).Background(col(top)).Render("▄"))
 		}
-		b.lines = append(b.lines, st.Render(sb.String()))
+		b.lines = append(b.lines, sb.String())
 	}
 	return b, true
 }

@@ -958,6 +958,12 @@ func sparkline(hist []float64, width, rows int, th theme, capV float64) []string
 			if r == capRow && fill < 8 && c%2 == 0 {
 				cell, col = "╌", th.warn
 			}
+			// A full cell is a background-coloured space rather than '█', so
+			// terminals with extra line spacing don't show seams in the bar.
+			if fill == 8 {
+				sb.WriteString(lipgloss.NewStyle().Background(col).Render(" "))
+				continue
+			}
 			sb.WriteString(fgs(col).Render(cell))
 		}
 		out[r] = sb.String()
